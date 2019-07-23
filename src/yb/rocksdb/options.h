@@ -42,6 +42,13 @@
 #undef max
 #endif
 
+namespace yb {
+
+class MemTracker;
+class PriorityThreadPool;
+
+}
+
 namespace rocksdb {
 
 class BoundaryValuesExtractor;
@@ -247,7 +254,7 @@ struct ColumnFamilyOptions {
   // thread-safe.
   //
   // Default: nullptr
-  const CompactionFilter* compaction_filter;
+  CompactionFilter* compaction_filter;
 
   // This is a factory that provides compaction filter objects which allow
   // an application to modify/delete a key-value during background compaction.
@@ -854,6 +861,15 @@ struct DBOptions {
   // Default: Env::Default()
   Env* env;
 
+  Env* get_checkpoint_env() const {
+    return checkpoint_env ? checkpoint_env : env;
+  }
+
+  // Env used to create checkpoints. Default: Env::Default()
+  Env* checkpoint_env;
+
+  yb::PriorityThreadPool* compaction_thread_pool = nullptr;
+
   // Use to control write rate of flush and compaction. Flush has higher
   // priority than compaction. Rate limiting is disabled if nullptr.
   // If rate limiter is enabled, bytes_per_sync is set to 1MB by default.
@@ -1318,6 +1334,12 @@ struct DBOptions {
 
   // A prefix for log messages, usually containing the tablet id.
   std::string log_prefix;
+
+  // This RocksDB instance root mem tracker.
+  std::shared_ptr<yb::MemTracker> mem_tracker;
+
+  // Specific mem tracker for block based tables created by this RocksDB instance.
+  std::shared_ptr<yb::MemTracker> block_based_table_mem_tracker;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)

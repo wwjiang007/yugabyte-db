@@ -30,6 +30,8 @@ import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SocketOptions;
+import com.datastax.driver.core.exceptions.InvalidQueryException;
+import com.datastax.driver.core.exceptions.OperationTimedOutException;
 import com.datastax.driver.core.exceptions.QueryValidationException;
 
 import org.slf4j.Logger;
@@ -112,6 +114,10 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     LOG.info("BaseCQLTest.setUpBeforeClass is running");
+    BaseMiniClusterTest.tserverArgs.add("--client_read_write_timeout_ms=180000");
+    BaseMiniClusterTest.tserverArgs.add("--start_redis_proxy=false");
+    BaseMiniClusterTest.tserverArgs.add("--start_pgsql_proxy=false");
+    BaseMiniClusterTest.tserverArgs.add("--enable_ysql=false");
 
     // Disable extended peer check, to ensure "SELECT * FROM system.peers" works without
     // all columns.
@@ -429,30 +435,46 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return iter;
   }
 
-  protected void runInvalidQuery(Statement stmt) {
+  protected Iterator<Row> runSelect(String select_stmt, Object... args) {
+    return runSelect(String.format(select_stmt, args));
+  }
+
+  protected String runInvalidQuery(Statement stmt) {
     try {
       session.execute(stmt);
       fail(String.format("Statement did not fail: %s", stmt));
+      return null; // Never happens, but keeps compiler happy
     } catch (QueryValidationException qv) {
       LOG.info("Expected exception", qv);
+      return qv.getCause().getMessage();
     }
   }
 
-  protected void runInvalidQuery(String stmt) {
-    runInvalidQuery(new SimpleStatement(stmt));
+  protected String runInvalidQuery(String stmt) {
+    return runInvalidQuery(new SimpleStatement(stmt));
   }
 
-  protected void runInvalidStmt(Statement stmt) {
+  protected String runInvalidStmt(Statement stmt, Session s) {
     try {
-      session.execute(stmt);
+      s.execute(stmt);
       fail(String.format("Statement did not fail: %s", stmt));
+      return null; // Never happens, but keeps compiler happy
     } catch (QueryValidationException qv) {
       LOG.info("Expected exception", qv);
+      return qv.getCause().getMessage();
     }
   }
 
-  protected void runInvalidStmt(String stmt) {
-    runInvalidStmt(new SimpleStatement(stmt));
+  protected String runInvalidStmt(Statement stmt) {
+    return runInvalidStmt(stmt, session);
+  }
+
+  protected String runInvalidStmt(String stmt, Session s) {
+    return runInvalidStmt(new SimpleStatement(stmt), s);
+  }
+
+  protected String runInvalidStmt(String stmt) {
+    return runInvalidStmt(stmt, session);
   }
 
   protected void assertNoRow(String select_stmt) {
@@ -529,6 +551,13 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     assertEquals(Arrays.stream(expectedRows).collect(Collectors.toList()), actualRows);
   }
 
+  /** Checks that the query yields an error containing the given (case-insensitive) substring */
+  protected void assertQueryError(String stmt, String expectedErrorSubstring) {
+    String result = runInvalidStmt(stmt);
+    assertTrue("Query error '" + result + "' did not contain '" + expectedErrorSubstring + "'",
+        result.toLowerCase().contains(expectedErrorSubstring.toLowerCase()));
+  }
+
   // blob type utils
   protected String makeBlobString(ByteBuffer buf) {
     StringBuilder sb = new StringBuilder();
@@ -550,12 +579,22 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return buffer;
   }
 
-  public ResultSet execute(String statement) throws Exception {
-    LOG.info("EXEC CQL: " + statement);
-    final ResultSet result = session.execute(statement);
-    LOG.info("EXEC CQL FINISHED: " + statement);
+  public ResultSet execute(String stmt, Session s) throws Exception {
+    LOG.info("EXEC CQL: " + stmt);
+    final ResultSet result = s.execute(stmt);
+    LOG.info("EXEC CQL FINISHED: " + stmt);
     return result;
   }
+
+  public ResultSet execute(String stmt) throws Exception { return execute(stmt, session); }
+
+  public void executeInvalid(String stmt, Session s) throws Exception {
+    LOG.info("EXEC INVALID CQL: " + stmt);
+    runInvalidStmt(stmt, s);
+    LOG.info("EXEC INVALID CQL FINISHED: " + stmt);
+  }
+
+  public void executeInvalid(String stmt) throws Exception { executeInvalid(stmt, session); }
 
   public void createKeyspace(String keyspaceName) throws Exception {
     String createKeyspaceStmt = "CREATE KEYSPACE \"" + keyspaceName + "\";";
@@ -618,17 +657,11 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return totalMetrics;
   }
 
-  private Set<String> getTableIds(String keyspaceName, String tableName) {
-    Set<String> ids = new HashSet<>();
-    for (Row row : session.execute("SELECT id FROM system.partitions " +
-                                   "WHERE keyspace_name = ? and table_name = ?;",
-                                   keyspaceName, tableName).all()) {
-      ids.add(ServerInfo.UUIDToHostString(row.getUUID("id")));
-    }
-    return ids;
+  private Set<String> getTableIds(String keyspaceName, String tableName)  throws Exception {
+    return miniCluster.getClient().getTabletUUIDs(keyspaceName, tableName);
   }
 
-  public RocksDBMetrics getRocksDBMetric(String tableName) throws IOException {
+  public RocksDBMetrics getRocksDBMetric(String tableName) throws Exception {
     Set<String> tabletIds = getTableIds(DEFAULT_TEST_KEYSPACE, tableName);
     RocksDBMetrics metrics = new RocksDBMetrics();
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
@@ -655,7 +688,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
 
   public int getTableCounterMetric(String keyspaceName,
                                    String tableName,
-                                   String metricName) throws IOException {
+                                   String metricName) throws Exception {
     int value = 0;
     Set<String> tabletIds = getTableIds(keyspaceName, tableName);
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {

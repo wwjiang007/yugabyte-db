@@ -53,6 +53,9 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/session.h"
+#include "yb/client/table_creator.h"
+#include "yb/client/tablet_server.h"
 #include "yb/client/yb_op.h"
 
 #include "yb/common/ql_expr.h"
@@ -120,7 +123,7 @@ static const int64_t kNoParticularCountExpected = -1;
 // facilitates checking for data integrity.
 class LinkedListTester {
  public:
-  LinkedListTester(std::shared_ptr<client::YBClient> client,
+  LinkedListTester(client::YBClient* client,
                    client::YBTableName table_name, int num_chains, int num_tablets,
                    int num_replicas, bool enable_mutation)
       : verify_projection_({kKeyColumnName, kLinkColumnName, kUpdatedColumnName}),
@@ -130,7 +133,7 @@ class LinkedListTester {
         num_replicas_(num_replicas),
         enable_mutation_(enable_mutation),
         latency_histogram_(1000000, 3),
-        client_(std::move(client)) {
+        client_(client) {
     client::YBSchemaBuilder b;
 
     b.AddColumn(kKeyColumnName)->Type(INT64)->NotNull()->HashPrimaryKey();
@@ -221,7 +224,7 @@ class LinkedListTester {
   const int num_replicas_;
   const bool enable_mutation_;
   HdrHistogram latency_histogram_;
-  std::shared_ptr<client::YBClient> client_;
+  client::YBClient* const client_;
   SnapsAndCounts sampled_hybrid_times_and_counts_;
 
  private:
@@ -263,9 +266,9 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
   }
 
   void ResetClientAndTester() {
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
-    tester_.reset(new LinkedListTester(client_, kTableName,
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
+    tester_.reset(new LinkedListTester(client_.get(),
+                                       kTableName,
                                        FLAGS_num_chains,
                                        FLAGS_num_tablets,
                                        FLAGS_replication_factor,
@@ -290,7 +293,7 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
     }
   }
 
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
   gscoped_ptr<LinkedListTester> tester_;
 };
 
@@ -548,7 +551,7 @@ Status LinkedListTester::LoadLinkedList(
 
   sampled_hybrid_times_and_counts_.clear();
   client::TableHandle table;
-  RETURN_NOT_OK_PREPEND(table.Open(table_name_, client_.get()),
+  RETURN_NOT_OK_PREPEND(table.Open(table_name_, client_),
                         "Could not open table " + table_name_.ToString());
 
   // Instantiate a hybrid clock so that we can collect hybrid_times since we're running the
@@ -585,13 +588,6 @@ Status LinkedListTester::LoadLinkedList(
     }
 
     auto now = CoarseMonoClock::Now();
-    if (next_sample < now) {
-      HybridTime now = ht_clock->Now();
-      sampled_hybrid_times_and_counts_.emplace_back(now, *written_count);
-      next_sample += sample_interval;
-      LOG(INFO) << "Sample at HT hybrid_time: " << now.ToString()
-                << " Inserted count: " << *written_count;
-    }
     if (deadline < now) {
       LOG(INFO) << "Finished inserting list. Added " << (*written_count) << " in chain";
       LOG(INFO) << "Last entries inserted had keys:";
@@ -599,6 +595,17 @@ Status LinkedListTester::LoadLinkedList(
         LOG(INFO) << i << ": " << chains[i]->prev_key();
       }
       return Status::OK();
+    }
+    // We cannot store snapshot on the last step, because his hybrid time could be in future,
+    // related to max time that could be served by one alive server.
+    // So we ensure that we always write some data after snapshot, to be sure that server would
+    // have at least time of snapshot as read time for follower.
+    if (next_sample < now) {
+      HybridTime now = ht_clock->Now();
+      sampled_hybrid_times_and_counts_.emplace_back(now, *written_count);
+      next_sample += sample_interval;
+      LOG(INFO) << "Sample at HT hybrid_time: " << now.ToString()
+                << " Inserted count: " << *written_count;
     }
     for (const auto& chain : chains) {
       RETURN_NOT_OK_PREPEND(chain->GenerateNextInsert(table, session.get()),
@@ -678,7 +685,7 @@ Status LinkedListTester::VerifyLinkedListRemote(
             << ", log_errors=" << log_errors
             << ", latest_at_leader=" << latest_at_leader;
   client::TableHandle table;
-  RETURN_NOT_OK(table.Open(table_name_, client_.get()));
+  RETURN_NOT_OK(table.Open(table_name_, client_));
 
   string snapshot_str;
   if (is_latest) {

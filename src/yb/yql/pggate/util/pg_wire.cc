@@ -18,16 +18,36 @@
 namespace yb {
 namespace pggate {
 
+void PgWire::WriteBool(bool value, faststring *buffer) {
+  buffer->append(&value, sizeof(bool));
+}
+
+void PgWire::WriteInt8(int8_t value, faststring *buffer) {
+  buffer->append(&value, sizeof(int8_t));
+}
+
 void PgWire::WriteUint8(uint8_t value, faststring *buffer) {
   buffer->append(&value, sizeof(uint8_t));
+}
+
+void PgWire::WriteUint16(uint16_t value, faststring *buffer) {
+  WriteInt(NetworkByteOrder::Store16, value, buffer);
 }
 
 void PgWire::WriteInt16(int16_t value, faststring *buffer) {
   WriteInt(NetworkByteOrder::Store16, static_cast<uint16>(value), buffer);
 }
 
+void PgWire::WriteUint32(uint32_t value, faststring *buffer) {
+  WriteInt(NetworkByteOrder::Store32, value, buffer);
+}
+
 void PgWire::WriteInt32(int32_t value, faststring *buffer) {
   WriteInt(NetworkByteOrder::Store32, static_cast<uint32>(value), buffer);
+}
+
+void PgWire::WriteUint64(uint64_t value, faststring *buffer) {
+  WriteInt(NetworkByteOrder::Store64, value, buffer);
 }
 
 void PgWire::WriteInt64(int64_t value, faststring *buffer) {
@@ -45,6 +65,14 @@ void PgWire::WriteDouble(double value, faststring *buffer) {
 }
 
 void PgWire::WriteText(const string& value, faststring *buffer) {
+  // Postgres expected text string to be null-terminated, so we have to add '\0' here.
+  // Postgres will call strlen() without using the returning byte count.
+  const uint64 length = value.size() + 1;
+  WriteInt(NetworkByteOrder::Store64, length, buffer);
+  buffer->append(static_cast<const void *>(value.c_str()), length);
+}
+
+void PgWire::WriteBinary(const string& value, faststring *buffer) {
   const uint64 length = value.size();
   WriteInt(NetworkByteOrder::Store64, length, buffer);
   buffer->append(value);
@@ -52,17 +80,42 @@ void PgWire::WriteText(const string& value, faststring *buffer) {
 
 //--------------------------------------------------------------------------------------------------
 // Read numbers.
-size_t PgWire::ReadNumber(Slice *cursor, uint8 *value) {
+
+// This is not called ReadBool but ReadNumber because it is invoked from the TranslateNumber
+// template function similarly to the rest of numeric types.
+size_t PgWire::ReadNumber(Slice *cursor, bool *value) {
+  *value = !!*reinterpret_cast<const bool*>(cursor->data());
+  return sizeof(bool);
+}
+
+size_t PgWire::ReadNumber(Slice *cursor, int8_t *value) {
+  *value = *reinterpret_cast<const int8_t*>(cursor->data());
+  return sizeof(int8_t);
+}
+
+size_t PgWire::ReadNumber(Slice *cursor, uint8_t *value) {
   *value = *reinterpret_cast<const uint8*>(cursor->data());
   return sizeof(uint8_t);
+}
+
+size_t PgWire::ReadNumber(Slice *cursor, uint16 *value) {
+  return ReadNumericValue(NetworkByteOrder::Load16, cursor, value);
 }
 
 size_t PgWire::ReadNumber(Slice *cursor, int16 *value) {
   return ReadNumericValue(NetworkByteOrder::Load16, cursor, reinterpret_cast<uint16*>(value));
 }
 
+size_t PgWire::ReadNumber(Slice *cursor, uint32 *value) {
+  return ReadNumericValue(NetworkByteOrder::Load32, cursor, value);
+}
+
 size_t PgWire::ReadNumber(Slice *cursor, int32 *value) {
   return ReadNumericValue(NetworkByteOrder::Load32, cursor, reinterpret_cast<uint32*>(value));
+}
+
+size_t PgWire::ReadNumber(Slice *cursor, uint64 *value) {
+  return ReadNumericValue(NetworkByteOrder::Load64, cursor, value);
 }
 
 size_t PgWire::ReadNumber(Slice *cursor, int64 *value) {

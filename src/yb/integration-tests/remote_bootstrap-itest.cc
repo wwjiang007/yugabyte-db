@@ -39,6 +39,8 @@
 
 #include "yb/client/client-test-util.h"
 #include "yb/client/client.h"
+#include "yb/client/table_creator.h"
+
 #include "yb/common/wire_protocol-test-util.h"
 #include "yb/fs/fs_manager.h"
 #include "yb/gutil/stl_util.h"
@@ -51,9 +53,13 @@
 #include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tserver/remote_bootstrap_client.h"
+#include "yb/tserver/remote_bootstrap_session.h"
 #include "yb/util/metrics.h"
+#include "yb/util/pb_util.h"
 #include "yb/util/pstack_watcher.h"
 #include "yb/util/test_util.h"
+
+using namespace std::literals;
 
 DEFINE_int32(test_delete_leader_num_iters, 3,
              "Number of iterations to run in TestDeleteLeaderDuringRemoteBootstrapStressTest.");
@@ -95,9 +101,12 @@ METRIC_DECLARE_counter(glog_error_messages);
 
 namespace yb {
 
+using yb::tablet::TabletDataState;
+
 class RemoteBootstrapITest : public YBTest {
  public:
   void TearDown() override {
+    client_.reset();
     if (HasFatalFailure()) {
       LOG(INFO) << "Found fatal failure";
       if (cluster_) {
@@ -113,6 +122,8 @@ class RemoteBootstrapITest : public YBTest {
                       "Couldn't dump stacks");
         }
       }
+    } else if (cluster_) {
+      CheckCheckpointsCleared();
     }
     if (cluster_) {
       cluster_->Shutdown();
@@ -143,17 +154,21 @@ class RemoteBootstrapITest : public YBTest {
 
   void ClientCrashesBeforeChangeRole(YBTableType table_type);
 
+  void StartCrashedTabletServer(
+      TabletDataState expected_data_state = TabletDataState::TABLET_DATA_TOMBSTONED);
+  void CheckCheckpointsCleared();
+
   gscoped_ptr<ExternalMiniCluster> cluster_;
   gscoped_ptr<itest::ExternalMiniClusterFsInspector> inspect_;
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
   itest::TabletServerMap ts_map_;
 
   MonoDelta crash_test_timeout_;
   vector<string> crash_test_tserver_flags_;
   std::unique_ptr<TestWorkload> crash_test_workload_;
-  TServerDetails* crash_test_leader_ts_;
-  int crash_test_tserver_index_;
-  int crash_test_leader_index_;
+  TServerDetails* crash_test_leader_ts_ = nullptr;
+  int crash_test_tserver_index_ = -1;
+  int crash_test_leader_index_ = -1;
   string crash_test_tablet_id_;
 };
 
@@ -163,7 +178,8 @@ void RemoteBootstrapITest::StartCluster(const vector<string>& extra_tserver_flag
   ExternalMiniClusterOptions opts;
   opts.num_tablet_servers = num_tablet_servers;
   opts.extra_tserver_flags = extra_tserver_flags;
-  opts.extra_tserver_flags.push_back("--never_fsync"); // fsync causes flakiness on EC2.
+  opts.extra_tserver_flags.emplace_back("--remote_bootstrap_idle_timeout_ms=10000");
+  opts.extra_tserver_flags.emplace_back("--never_fsync"); // fsync causes flakiness on EC2.
   opts.extra_master_flags = extra_master_flags;
   cluster_.reset(new ExternalMiniCluster(opts));
   ASSERT_OK(cluster_->Start());
@@ -171,8 +187,39 @@ void RemoteBootstrapITest::StartCluster(const vector<string>& extra_tserver_flag
   ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
                                          &cluster_->proxy_cache(),
                                          &ts_map_));
-  YBClientBuilder builder;
-  ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+  client_ = ASSERT_RESULT(cluster_->CreateClient());
+}
+
+void RemoteBootstrapITest::CheckCheckpointsCleared() {
+  auto* env = Env::Default();
+  auto deadline = MonoTime::Now() + 10s * kTimeMultiplier;
+  for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    auto tablet_server = cluster_->tablet_server(i);
+    auto data_dir = tablet_server->GetFullDataDir();
+    SCOPED_TRACE(Format("Index: $0", i));
+    SCOPED_TRACE(Format("UUID: $0", tablet_server->uuid()));
+    SCOPED_TRACE(Format("Data dir: $0", data_dir));
+    auto meta_dir = FsManager::GetRaftGroupMetadataDir(data_dir);
+    auto tablets = ASSERT_RESULT(env->GetChildren(meta_dir, ExcludeDots::kTrue));
+    for (const auto& tablet : tablets) {
+      SCOPED_TRACE(Format("Tablet: $0", tablet));
+      auto metadata_path = JoinPathSegments(meta_dir, tablet);
+      tablet::RaftGroupReplicaSuperBlockPB superblock;
+      ASSERT_OK(pb_util::ReadPBContainerFromPath(env, metadata_path, &superblock));
+      auto checkpoints_dir = JoinPathSegments(
+          superblock.kv_store().rocksdb_dir(), tserver::RemoteBootstrapSession::kCheckpointsDir);
+      ASSERT_OK(Wait([env, checkpoints_dir]() -> bool {
+        if (env->FileExists(checkpoints_dir)) {
+          auto checkpoints = CHECK_RESULT(env->GetChildren(checkpoints_dir, ExcludeDots::kTrue));
+          if (!checkpoints.empty()) {
+            LOG(INFO) << "Checkpoints: " << yb::ToString(checkpoints);
+            return false;
+          }
+        }
+        return true;
+      }, deadline, "Wait checkpoints empty"));
+    }
+  }
 }
 
 void RemoteBootstrapITest::CrashTestSetUp(YBTableType table_type) {
@@ -281,8 +328,20 @@ void RemoteBootstrapITest::CrashTestVerify() {
   // from TSManager::GetAllDescriptors. This list includes the tserver that is in a crash loop, and
   // the check will always fail.
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(crash_test_workload_->table_name(),
-                                           ClusterVerifier::AT_LEAST,
-                                           crash_test_workload_->rows_inserted()));
+                                                  ClusterVerifier::AT_LEAST,
+                                                  crash_test_workload_->rows_inserted()));
+
+  StartCrashedTabletServer();
+}
+
+void RemoteBootstrapITest::StartCrashedTabletServer(TabletDataState expected_data_state) {
+  // Restore leader so it could cleanup checkpoint.
+  LOG(INFO) << "Starting crashed " << crash_test_leader_index_;
+  // Actually it is already stopped, calling shutdown to synchronize state.
+  cluster_->tablet_server(crash_test_leader_index_)->Shutdown();
+  ASSERT_OK(cluster_->tablet_server(crash_test_leader_index_)->Start());
+  ASSERT_OK(inspect_->WaitForTabletDataStateOnTS(
+      crash_test_leader_index_, crash_test_tablet_id_, expected_data_state));
 }
 
 // If a rogue (a.k.a. zombie) leader tries to remote bootstrap a tombstoned
@@ -457,7 +516,7 @@ void RemoteBootstrapITest::DeleteTabletDuringRemoteBootstrap(YBTableType table_t
   // Start up a RemoteBootstrapClient and open a remote bootstrap session.
   gscoped_ptr<RemoteBootstrapClient> rb_client(
       new RemoteBootstrapClient(tablet_id, fs_manager.get(), fs_manager->uuid()));
-  scoped_refptr<tablet::TabletMetadata> meta;
+  scoped_refptr<tablet::RaftGroupMetadata> meta;
   ASSERT_OK(rb_client->Start(cluster_->tablet_server(kTsIndex)->uuid(),
                              &cluster_->proxy_cache(),
                              cluster_->tablet_server(kTsIndex)->bound_rpc_hostport(),
@@ -471,6 +530,7 @@ void RemoteBootstrapITest::DeleteTabletDuringRemoteBootstrap(YBTableType table_t
   ASSERT_OK(rb_client->FetchAll(&listener));
   // Call Finish, which closes the remote session.
   ASSERT_OK(rb_client->Finish());
+  ASSERT_OK(rb_client->Remove());
 
   SleepFor(MonoDelta::FromMilliseconds(500));  // Give a little time for a crash (KUDU-1009).
   ASSERT_TRUE(cluster_->tablet_server(kTsIndex)->IsProcessAlive());
@@ -487,10 +547,18 @@ void RemoteBootstrapITest::DeleteTabletDuringRemoteBootstrap(YBTableType table_t
 // as the remote bootstrap source. When a tablet is tombstoned, its last-logged
 // opid is stored in a field its on-disk superblock.
 void RemoteBootstrapITest::RemoteBootstrapFollowerWithHigherTerm(YBTableType table_type) {
-  vector<string> ts_flags, master_flags;
-  ts_flags.push_back("--enable_leader_failure_detection=false");
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
-  master_flags.push_back("--replication_factor=2");
+  std::vector<std::string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+    // Disable pre-elections since we wait for term to become 2,
+    // that does not happen with pre-elections
+    "--use_preelection=false"s
+  };
+
+  std::vector<std::string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--replication_factor=2"s
+  };
+
   const int kNumTabletServers = 2;
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumTabletServers));
 
@@ -595,15 +663,9 @@ void RemoteBootstrapITest::ConcurrentRemoteBootstraps(YBTableType table_type) {
   // remotely bootstrapped to a single target node from the same leader host.
   const int kNumTablets = 10;
   YBSchema client_schema(YBSchemaFromSchema(GetSimpleTestSchema()));
-  vector<const YBPartialRow*> splits;
-  for (int i = 0; i < kNumTablets - 1; i++) {
-    YBPartialRow* row = client_schema.NewRow();
-    ASSERT_OK(row->SetInt32(0, numeric_limits<int32_t>::max() / kNumTablets * (i + 1)));
-    splits.push_back(row);
-  }
   gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(TestWorkloadOptions::kDefaultTableName)
-                          .split_rows(splits)
+                          .num_tablets(kNumTablets)
                           .schema(&client_schema)
                           .table_type(table_type)
                           .Create());
@@ -979,6 +1041,8 @@ void RemoteBootstrapITest::ClientCrashesBeforeChangeRole(YBTableType table_type)
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(crash_test_workload_->table_name(),
                                                   ClusterVerifier::AT_LEAST,
                                                   crash_test_workload_->rows_inserted()));
+
+  StartCrashedTabletServer(TabletDataState::TABLET_DATA_READY);
 }
 
 TEST_F(RemoteBootstrapITest, TestVeryLongRemoteBootstrap) {
@@ -1059,10 +1123,10 @@ TEST_F(RemoteBootstrapITest, TestVeryLongRemoteBootstrap) {
   ASSERT_OK(WaitForServersToAgree(timeout, ts_map_, tablet_id, workload.batches_completed()));
 
   ClusterVerifier cluster_verifier(cluster_.get());
-      ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
-      ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(workload.table_name(),
-                                                      ClusterVerifier::AT_LEAST,
-                                                      workload.rows_inserted()));
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(workload.table_name(),
+                                                  ClusterVerifier::AT_LEAST,
+                                                  workload.rows_inserted()));
 }
 
 TEST_F(RemoteBootstrapITest, TestRejectRogueLeaderKeyValueType) {

@@ -20,6 +20,7 @@
 #include <vector>
 #include <boost/function.hpp>
 
+#include "yb/docdb/docdb_fwd.h"
 #include "yb/rocksdb/db.h"
 
 #include "yb/common/doc_hybrid_time.h"
@@ -29,11 +30,12 @@
 
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_kv_util.h"
-#include "yb/docdb/doc_operation.h"
 #include "yb/docdb/doc_path.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb.pb.h"
+#include "yb/docdb/expiration.h"
 #include "yb/docdb/intent.h"
+#include "yb/docdb/lock_batch.h"
 #include "yb/docdb/primitive_value.h"
 #include "yb/docdb/shared_lock_manager_fwd.h"
 #include "yb/docdb/value.h"
@@ -42,7 +44,7 @@
 #include "yb/util/status.h"
 #include "yb/util/strongly_typed_bool.h"
 
-// Document DB mapping on top of the key-value map in RocksDB:
+// DocDB mapping on top of the key-value map in RocksDB:
 // <document_key> <hybrid_time> -> <doc_type>
 // <document_key> <hybrid_time> <key_a> <gen_ts_a> -> <subdoc_a_type_or_value>
 //
@@ -81,6 +83,9 @@ class Histogram;
 
 namespace docdb {
 
+class DeadlineInfo;
+class DocOperation;
+
 // This function prepares the transaction by taking locks. The set of keys locked are returned to
 // the caller via the keys_locked argument (because they need to be saved and unlocked when the
 // transaction commits). A flag is also returned to indicate if any of the write operations
@@ -99,13 +104,22 @@ namespace docdb {
 //
 // Input: doc_write_ops
 // Context: lock_manager
-// Outputs: write_batch, need_read_snapshot
-void PrepareDocWriteOperation(const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
-                              const scoped_refptr<Histogram>& write_lock_latency,
-                              IsolationLevel isolation_level,
-                              SharedLockManager *lock_manager,
-                              LockBatch *keys_locked,
-                              bool *need_read_snapshot);
+
+struct PrepareDocWriteOperationResult {
+  LockBatch lock_batch;
+  bool need_read_snapshot = false;
+};
+
+Result<PrepareDocWriteOperationResult> PrepareDocWriteOperation(
+    const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
+    const google::protobuf::RepeatedPtrField<KeyValuePairPB>& read_pairs,
+    const scoped_refptr<Histogram>& write_lock_latency,
+    IsolationLevel isolation_level,
+    OperationKind operation_kind,
+    bool transactional_table,
+    CoarseTimePoint deadline,
+    PartialRangeKeyIntents partial_range_key_intents,
+    SharedLockManager *lock_manager);
 
 // This constructs a DocWriteBatch using the given list of DocOperations, reading the previous
 // state of data from RocksDB when necessary.
@@ -117,7 +131,7 @@ void PrepareDocWriteOperation(const std::vector<std::unique_ptr<DocOperation>>& 
 // operation that happens after Raft replication.
 CHECKED_STATUS ExecuteDocWriteOperation(
     const std::vector<std::unique_ptr<DocOperation>>& doc_write_ops,
-    MonoTime deadline,
+    CoarseTimePoint deadline,
     const ReadHybridTime& read_time,
     const DocDB& doc_db,
     KeyValueWriteBatchPB* write_batch,
@@ -144,9 +158,15 @@ void PrepareNonTransactionWriteBatch(
 // from it triggers heap allocation."
 // So, we use boost::function which doesn't have such issue:
 // http://www.boost.org/doc/libs/1_65_1/doc/html/function/misc.html
+typedef boost::function<Status(IntentStrength, Slice, KeyBytes*)> EnumerateIntentsCallback;
+
 CHECKED_STATUS EnumerateIntents(
-    const google::protobuf::RepeatedPtrField<yb::docdb::KeyValuePairPB> &kv_pairs,
-    boost::function<Status(IntentKind, Slice, KeyBytes*)> functor);
+    const google::protobuf::RepeatedPtrField<yb::docdb::KeyValuePairPB>& kv_pairs,
+    const EnumerateIntentsCallback& functor, PartialRangeKeyIntents partial_range_key_intents);
+
+CHECKED_STATUS EnumerateIntents(
+    Slice key, const Slice& intent_value, const EnumerateIntentsCallback& functor,
+    KeyBytes* encoded_key_buffer, PartialRangeKeyIntents partial_range_key_intents);
 
 void PrepareTransactionWriteBatch(
     const docdb::KeyValueWriteBatchPB& put_batch,
@@ -154,10 +174,11 @@ void PrepareTransactionWriteBatch(
     rocksdb::WriteBatch* rocksdb_write_batch,
     const TransactionId& transaction_id,
     IsolationLevel isolation_level,
+    PartialRangeKeyIntents partial_range_key_intents,
     IntraTxnWriteId* write_id);
 
 CHECKED_STATUS PrepareApplyIntentsBatch(
-    const TransactionId& transaction_id, HybridTime commit_ht,
+    const TransactionId& transaction_id, HybridTime commit_ht, const KeyBounds* key_bounds,
     rocksdb::WriteBatch* regular_batch,
     rocksdb::DB* intents_db, rocksdb::WriteBatch* intents_batch);
 
@@ -331,6 +352,8 @@ struct GetSubDocumentData {
   SubDocument* result;
   bool* doc_found;
 
+  DeadlineInfo* deadline_info = nullptr;
+
   // The TTL and hybrid time are return values external to the SubDocument
   // which occasionally need to be accessed for TTL calculation.
   mutable Expiration exp;
@@ -353,6 +376,7 @@ struct GetSubDocumentData {
   GetSubDocumentData Adjusted(
       const Slice& subdoc_key, SubDocument* result_, bool* doc_found_ = nullptr) const {
     GetSubDocumentData result(subdoc_key, result_, doc_found_);
+    result.deadline_info = deadline_info;
     result.exp = exp;
     result.return_type_only = return_type_only;
     result.low_subkey = low_subkey;
@@ -430,7 +454,7 @@ yb::Status GetSubDocument(
     const GetSubDocumentData& data,
     const rocksdb::QueryId query_id,
     const TransactionOperationContextOpt& txn_op_context,
-    MonoTime deadline,
+    CoarseTimePoint deadline,
     const ReadHybridTime& read_time = ReadHybridTime::Max());
 
 // This retrieves the TTL for a key.
@@ -456,6 +480,15 @@ std::string DocDBDebugDumpToStr(
     IncludeBinary include_binary = IncludeBinary::kFalse);
 
 std::string DocDBDebugDumpToStr(DocDB docdb, IncludeBinary include_binary = IncludeBinary::kFalse);
+
+template <class T>
+void DocDBDebugDumpToContainer(
+    rocksdb::DB* rocksdb, T* out, StorageDbType db_type = StorageDbType::kRegular,
+    IncludeBinary include_binary = IncludeBinary::kFalse);
+
+template <class T>
+void DocDBDebugDumpToContainer(
+    DocDB docdb, T* out, IncludeBinary include_binary = IncludeBinary::kFalse);
 
 void ConfigureDocDBRocksDBOptions(rocksdb::Options* options);
 

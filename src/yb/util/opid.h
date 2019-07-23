@@ -51,6 +51,14 @@ struct OpId {
   }
 
   template <class PB>
+  PB ToPB() const {
+    PB out;
+    out.set_term(term);
+    out.set_index(index);
+    return out;
+  }
+
+  template <class PB>
   static OpId FromPB(const PB& pb) {
     return OpId(pb.term(), pb.index());
   }
@@ -81,6 +89,14 @@ inline bool operator>=(const OpId& lhs, const OpId& rhs) {
 }
 
 std::ostream& operator<<(std::ostream& out, const OpId& op_id);
+
+size_t hash_value(const OpId& op_id) noexcept;
+
+struct OpIdHash {
+  size_t operator()(const OpId& v) const {
+    return hash_value(v);
+  }
+};
 
 } // namespace yb
 

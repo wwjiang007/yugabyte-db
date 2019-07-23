@@ -20,8 +20,15 @@
 #include <functional>
 
 #include "yb/client/client.h"
+#include "yb/client/table.h"
+
 #include "yb/common/index.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/util/flag_tags.h"
+
+DEFINE_bool(enable_uncovered_index_select, true,
+            "Enable executing select statements using uncovered index");
+TAG_FLAG(enable_uncovered_index_select, advanced);
 
 namespace yb {
 namespace ql {
@@ -76,33 +83,25 @@ class Selectivity {
   // Selectivity of the indexed table.
   Selectivity(MemoryContext *memctx, const PTSelectStmt& stmt)
       : is_local_(true),
-        hash_length_(stmt.table()->schema().num_hash_key_columns()),
         covers_fully_(true) {
     const client::YBSchema& schema = stmt.table()->schema();
     MCIdToIndexMap id_to_idx(memctx);
     for (size_t i = 0; i < schema.num_key_columns(); i++) {
       id_to_idx.emplace(schema.ColumnId(i), i);
     }
-    Analyze(memctx, stmt, id_to_idx, schema.num_hash_key_columns());
+    Analyze(memctx, stmt, id_to_idx, schema.num_key_columns(), schema.num_hash_key_columns());
   }
 
   // Selectivity of an index.
   Selectivity(MemoryContext *memctx, const PTSelectStmt& stmt, const IndexInfo& index_info)
       : index_id_(index_info.table_id()),
         is_local_(index_info.is_local()),
-        hash_length_(index_info.hash_column_count()) {
+        covers_fully_(CoversFully(index_info, stmt.column_refs())) {
     MCIdToIndexMap id_to_idx(memctx);
     for (size_t i = 0; i < index_info.key_column_count(); i++) {
       id_to_idx.emplace(index_info.column(i).indexed_column_id, i);
     }
-    Analyze(memctx, stmt, id_to_idx, index_info.hash_column_count());
-
-    // If prefix length is 0, the table is going to be better than the index anyway (because prefix
-    // length 0 means do full index scan), so don't even check whether the index covers the read
-    // fully.
-    if (prefix_length_ > 0) {
-      covers_fully_ = CoversFully(index_info, stmt.column_refs());
-    }
+    Analyze(memctx, stmt, id_to_idx, index_info.key_column_count(), index_info.hash_column_count());
   }
 
   bool covers_fully() const { return covers_fully_; }
@@ -111,41 +110,56 @@ class Selectivity {
 
   // Comparison operator to sort the selectivity of an index.
   bool operator>(const Selectivity& other) const {
-    // If different prefix lengths, the longer one is better.
-    if (prefix_length_ != other.prefix_length_) {
-      return prefix_length_ > other.prefix_length_;
+    // If one is a single-key read and the other is not, prefer the one that is.
+    if (single_key_read_ != other.single_key_read_) {
+      return single_key_read_ > other.single_key_read_;
     }
 
-    // If same prefix lengths, the longer the hash length the better.
-    if (hash_length_ != other.hash_length_) {
-      return hash_length_ > other.hash_length_;
+    // If one is a full-table scan and the other is not, prefer the one that is not.
+    if (full_table_scan_ != other.full_table_scan_) {
+      return full_table_scan_ < other.full_table_scan_;
     }
 
-    // If same prefix and hash lengths, but one ends with a range query and the other does not, the
-    // one that does is better.
-    if (ends_with_range_ != other.ends_with_range_) {
-      return ends_with_range_ > other.ends_with_range_;
+    // When neither is a full table scan, compare the scan ranges.
+    if (!full_table_scan_ && !other.full_table_scan_) {
+
+      // If the fully-specified prefixes are different, prefer the one with longer prefix.
+      if (prefix_length_ != other.prefix_length_) {
+        return prefix_length_ > other.prefix_length_;
+      }
+
+      // If one has a range clause after the fully specified prefix and the other does not, prefer
+      // the one that does.
+      if (ends_with_range_ != other.ends_with_range_) {
+        return ends_with_range_ > other.ends_with_range_;
+      }
+
+      // If the numbers of non-primary-key column operators needs to be evaluated are different,
+      // prefer the one with less.
+      if (num_non_key_ops_ != other.num_non_key_ops_) {
+        return num_non_key_ops_ < other.num_non_key_ops_;
+      }
     }
 
-    // If both previous values are the same, the indexed table is better than the index.
-    if (index_id_.empty() != other.index_id_.empty()) {
-      return index_id_.empty() > other.index_id_.empty();
-    }
-
-    // An index that covers the read fully is better than one that does not.
+    // If one covers the read fully and the other does not, prefer the one that does.
     if (covers_fully_ != other.covers_fully_) {
       return covers_fully_ > other.covers_fully_;
     }
 
-    // If all previous values are the same, a local index (or indexed table) is better than a
-    // non-local index.
-    return is_local_ > other.is_local_;
+    // If one is local read and the other is not, prefer the one that is.
+    if (is_local_ != other.is_local_) {
+      return is_local_ > other.is_local_;
+    }
+
+    // When all the above are equal, prefer the indexed table over the index.
+    return index_id_.empty() > other.index_id_.empty();
   }
 
   string ToString() const {
-    return strings::Substitute("Selectivity: index_id $0 is_local $1 hash_length $2 "
-                               "prefix_length $3 ends_with_range $4 covers_fully $5", index_id_,
-                               is_local_, hash_length_, prefix_length_, ends_with_range_,
+    return strings::Substitute("Selectivity: index_id $0 is_local $1 prefix_length $2 "
+                               "single_key_read $3 full_table_scan $4 ends_with_range $5 "
+                               "covers_fully $6", index_id_, is_local_, prefix_length_,
+                               single_key_read_, full_table_scan_, ends_with_range_,
                                covers_fully_);
   }
 
@@ -156,82 +170,50 @@ class Selectivity {
   void Analyze(MemoryContext *memctx,
                const PTSelectStmt& stmt,
                const MCIdToIndexMap& id_to_idx,
-               size_t num_hash_key_columns) {
+               const size_t num_key_columns,
+               const size_t num_hash_key_columns) {
     // The operator on each column, in the order of the columns in the table or index we analyze.
     MCVector<OpSelectivity> ops(id_to_idx.size(), OpSelectivity::kNone, memctx);
     for (const ColumnOp& col_op : stmt.key_where_ops()) {
       const auto iter = id_to_idx.find(col_op.desc()->id());
       if (iter != id_to_idx.end()) {
         ops[iter->second] = GetOperatorSelectivity(col_op.yb_op());
+      } else {
+        num_non_key_ops_++;
       }
     }
     for (const ColumnOp& col_op : stmt.where_ops()) {
       const auto iter = id_to_idx.find(col_op.desc()->id());
       if (iter != id_to_idx.end()) {
         ops[iter->second] = GetOperatorSelectivity(col_op.yb_op());
+      } else {
+        num_non_key_ops_++;
       }
     }
 
-    // Now find the prefix length.
+    // Find the length of fully specified prefix in index or indexed table.
     while (prefix_length_ < ops.size() && ops[prefix_length_] == OpSelectivity::kEqual) {
       prefix_length_++;
     }
 
-    // If hash key not fully specified, set prefix length to 0, as we will have to do a full table
-    // scan anyway.
-    if (prefix_length_ < num_hash_key_columns) {
-      prefix_length_ = 0;
-      return;
-    }
-
-    // Now find out if it ends with a range.
-    ends_with_range_ = (prefix_length_ < ops.size()) &&
-                       ops[prefix_length_] == OpSelectivity::kRange;
+    // Determine if it is a single-key read, a full-table scan, if there is a range clause after
+    // prefix.
+    single_key_read_ = prefix_length_ >= num_key_columns;
+    full_table_scan_ = prefix_length_ < num_hash_key_columns;
+    ends_with_range_ = prefix_length_ < ops.size() && ops[prefix_length_] == OpSelectivity::kRange;
   }
 
-  TableId index_id_;         // Index table id (null for indexed table).
-  bool is_local_ = false;    // Whether the index is local (true for indexed table).
-  size_t hash_length_ = 0;   // Length of hash key in index or indexed table.
-  size_t prefix_length_ = 0; // Length of fully specified prefix in index or indexed table.
-  bool ends_with_range_ = false; // Whether there is a range clause after prefix.
-  bool covers_fully_ = false; // Whether the index covers the read fully (true for indexed table).
+  TableId index_id_;      // Index table id (null for indexed table).
+  bool is_local_ = false; // Is the index local? (true for indexed table)
+  size_t prefix_length_ = 0;     // Length of fully-specified prefix in index or indexed table.
+  bool single_key_read_ = false; // Will this be a single-key read?
+  bool full_table_scan_ = false; // Will this be a full table scan?
+  bool ends_with_range_ = false; // Is there a range clause after prefix?
+  size_t num_non_key_ops_ = 0; // How many non-primary-key column operators needs to be evaluated?
+  bool covers_fully_ = false;  // Does the index cover the read fully? (true for indexed table)
 };
 
 } // namespace
-
-//--------------------------------------------------------------------------------------------------
-
-PTValues::PTValues(MemoryContext *memctx,
-                   YBLocation::SharedPtr loc,
-                   PTExprListNode::SharedPtr tuple)
-    : PTCollection(memctx, loc),
-      tuples_(memctx, loc) {
-  Append(tuple);
-}
-
-PTValues::~PTValues() {
-}
-
-void PTValues::Append(const PTExprListNode::SharedPtr& tuple) {
-  tuples_.Append(tuple);
-}
-
-void PTValues::Prepend(const PTExprListNode::SharedPtr& tuple) {
-  tuples_.Prepend(tuple);
-}
-
-CHECKED_STATUS PTValues::Analyze(SemContext *sem_context) {
-  return Status::OK();
-}
-
-void PTValues::PrintSemanticAnalysisResult(SemContext *sem_context) {
-  VLOG(3) << "SEMANTIC ANALYSIS RESULT (" << *loc_ << "):\n" << "Not yet avail";
-}
-
-PTExprListNode::SharedPtr PTValues::Tuple(int index) const {
-  DCHECK_GE(index, 0);
-  return tuples_.element(index);
-}
 
 //--------------------------------------------------------------------------------------------------
 
@@ -257,6 +239,27 @@ PTSelectStmt::PTSelectStmt(MemoryContext *memctx,
       offset_clause_(offset_clause) {
 }
 
+// Construct a nested select tnode to select from the index. Only the syntactic information
+// populated by the parser should be cloned or set here. Semantic information should be left in
+// the initial state to be populated when this tnode is analyzed.
+PTSelectStmt::PTSelectStmt(MemoryContext *memctx,
+                           const PTSelectStmt& other,
+                           PTExprListNode::SharedPtr selected_exprs,
+                           const TableId& index_id,
+                           const bool covers_fully)
+    : PTDmlStmt(memctx, other),
+      distinct_(other.distinct_),
+      selected_exprs_(selected_exprs),
+      from_clause_(other.from_clause_),
+      group_by_clause_(other.group_by_clause_),
+      having_clause_(other.having_clause_),
+      order_by_clause_(other.order_by_clause_),
+      limit_clause_(other.limit_clause_),
+      offset_clause_(other.offset_clause_),
+      index_id_(index_id),
+      covers_fully_(covers_fully) {
+}
+
 PTSelectStmt::~PTSelectStmt() {
 }
 
@@ -266,13 +269,14 @@ Status PTSelectStmt::LookupIndex(SemContext *sem_context) {
   if (!table_ || !table_->IsIndex() ||
       // Only looking for CQL Indexes.
       (table_->table_type() != client::YBTableType::YQL_TABLE_TYPE)) {
-    return sem_context->Error(table_loc(), ErrorCode::TABLE_NOT_FOUND);
+    return sem_context->Error(table_loc(), ErrorCode::OBJECT_NOT_FOUND);
   }
   LoadSchema(sem_context, table_, &column_map_);
   return Status::OK();
 }
 
 CHECKED_STATUS PTSelectStmt::Analyze(SemContext *sem_context) {
+  // If use_cassandra_authentication is set, permissions are checked in PTDmlStmt::Analyze.
   RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));
 
   if (index_id_.empty()) {
@@ -291,18 +295,6 @@ CHECKED_STATUS PTSelectStmt::Analyze(SemContext *sem_context) {
       return (is_system() && table_ == nullptr) ? Status::OK() : s;
     }
   } else {
-    // Reset previous analysis results pertaining to the use of indexed table done below before
-    // re-analyze using the index.
-    func_ops_.clear();
-    key_where_ops_.clear();
-    where_ops_.clear();
-    subscripted_col_where_ops_.clear();
-    json_col_where_ops_.clear();
-    partition_key_ops_.clear();
-    hash_col_bindvars_.clear();
-    column_refs_.clear();
-    static_column_refs_.clear();
-
     RETURN_NOT_OK(LookupIndex(sem_context));
   }
 
@@ -340,16 +332,17 @@ CHECKED_STATUS PTSelectStmt::Analyze(SemContext *sem_context) {
   // Run error checking on the WHERE conditions.
   RETURN_NOT_OK(AnalyzeWhereClause(sem_context));
 
-  RETURN_NOT_OK(AnalyzeOrderByClause(sem_context));
-
-  // Check whether we should use an index.
+  // Check if there is an index to use. If there is and it covers the query fully, we will query
+  // just the index and that is it.
   if (index_id_.empty()) {
     RETURN_NOT_OK(AnalyzeIndexes(sem_context));
-    // If AnalyzeIndexes() decides to use index, just return since a full re-analysis has been done.
-    if (!index_id_.empty()) {
+    if (child_select_ && child_select_->covers_fully_) {
       return Status::OK();
     }
   }
+
+  // Run error checking on order by for the chosen INDEX.
+  RETURN_NOT_OK(AnalyzeOrderByClause(sem_context));
 
   // Run error checking on the LIMIT clause.
   RETURN_NOT_OK(AnalyzeLimitClause(sem_context));
@@ -367,13 +360,71 @@ void PTSelectStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
   VLOG(3) << "SEMANTIC ANALYSIS RESULT (" << *loc_ << "):\n" << "Not yet avail";
 }
 
+ExplainPlanPB PTSelectStmt::AnalysisResultToPB() {
+  ExplainPlanPB explain_plan;
+  SelectPlanPB *select_plan = explain_plan.mutable_select_plan();
+  // Determines scan_type, child_select_ != null means an index is being used.
+  if (child_select_) {
+    string index_type = (child_select_->covers_fully() ? "Index Only" : "Index");
+    string lookup_type = (child_select_->select_has_primary_keys_set_ ? "Key Lookup" : "Scan");
+    select_plan->set_select_type(index_type + " " + lookup_type + " using " +
+      child_select()->table()->name().ToString() + " on " + table_name().ToString());
+  // Index is not being used, query only uses main table.
+  } else if (select_has_primary_keys_set_) {
+    select_plan->set_select_type("Primary Key Lookup on " + table_name().ToString());
+  } else if (!(key_where_ops().empty() && partition_key_ops().empty())) {
+    select_plan->set_select_type("Range Scan on " + table_name().ToString());
+  } else {
+    select_plan->set_select_type("Seq Scan on " + table_name().ToString());
+  }
+  string key_conditions = "  Key Conditions: ";
+  string filter = "  Filter: ";
+  size_t longest = 0;
+  // If overarching information( "Aggregate" | "Limit") then rest of the explain plan output needs
+  // to be indented.
+  if (is_aggregate() || limit_clause_) {
+    string aggr = (is_aggregate()) ? "Aggregate" : "Limit";
+    select_plan->set_aggregate(aggr);
+    key_conditions = "      " + key_conditions;
+    filter = "      " + filter;
+    select_plan->set_select_type("  ->  " + select_plan->select_type());
+    longest = max(longest, aggr.length());
+  }
+  longest = max(longest, select_plan->select_type().length());
+  // If index is being used, change the split of key conditions and filters to that of the index.
+  const auto& keys = child_select_ ? child_select_->key_where_ops() : key_where_ops();
+  const auto& filters = child_select_ ? child_select_->where_ops() : where_ops();
+  // Rebuild the conditions and filter into strings from internal format.
+  string filled_key_conds = conditionsToString<MCVector<ColumnOp>>(keys);
+  string filled_filter = conditionsToString<MCList<ColumnOp>>(filters);
+
+  filled_key_conds += partitionkeyToString(partition_key_ops());
+
+  // If the query has key conditions or filters on either the index or the main table, then output
+  // to query plan.
+  if (!filled_key_conds.empty()) {
+    key_conditions += filled_key_conds;
+    longest = max(longest, key_conditions.length());
+    select_plan->set_key_conditions(key_conditions);
+  }
+  if (!filled_filter.empty()) {
+    filter += filled_filter;
+    longest = max(longest, filter.length());
+    select_plan->set_filter(filter);
+  }
+
+  // Set the output_width that has been calculated throughout the construction of the query plan.
+  select_plan->set_output_width(longest);
+  return explain_plan;
+}
 //--------------------------------------------------------------------------------------------------
 
 // Check whether we can use an index.
 CHECKED_STATUS PTSelectStmt::AnalyzeIndexes(SemContext *sem_context) {
   VLOG(3) << "AnalyzeIndexes: " << sem_context->stmt();
-  // TODO: Support query involving static columns or distinct using index. Skipping for now.
-  if (table_->index_map().empty() || !static_column_refs_.empty() || distinct_) {
+  // Skip if there is no index, or the query involves token() since the query by partition key is
+  // more efficient on the indexed table.
+  if (table_->index_map().empty() || !partition_key_ops_.empty()) {
     return Status::OK();
   }
 
@@ -392,20 +443,55 @@ CHECKED_STATUS PTSelectStmt::AnalyzeIndexes(SemContext *sem_context) {
     }
   }
 
-  // Find the best selectivity. For now, we will use an index only if it covers the read fully.
+  // Find the best selectivity.
   for (const Selectivity& selectivity : selectivities) {
-    if (selectivity.covers_fully()) {
-      VLOG(3) << "Selected = " << selectivity.ToString();
-      if (!selectivity.index_id().empty()) {
-        index_id_ = selectivity.index_id();
-        covers_fully_ = true;
-
-        // If index is to be used, re-analyze using the index.
-        sem_context->Reset();
-        return Analyze(sem_context);
-      }
-      break;
+    if (!FLAGS_enable_uncovered_index_select && !selectivity.covers_fully()) {
+      continue;
     }
+
+    VLOG(3) << "Selected = " << selectivity.ToString();
+
+    // If an index can be used, analyze the select on the index.
+    if (!selectivity.index_id().empty()) {
+      MemoryContext* memctx = sem_context->PTreeMem();
+      auto selected_exprs = selected_exprs_;
+
+      // If the index does not cover the query fully, select the primary key from the index.
+      if (!selectivity.covers_fully()) {
+        const auto& loc = selected_exprs_->loc_ptr();
+        selected_exprs = PTExprListNode::MakeShared(memctx, loc);
+        for (int i = 0; i < num_key_columns(); i++) {
+          const client::YBColumnSchema& column = table_->schema().Column(i);
+          auto column_name_str = MCMakeShared<MCString>(memctx, column.name().c_str());
+          auto column_name = PTQualifiedName::MakeShared(memctx, loc, column_name_str);
+          selected_exprs->Append(PTRef::MakeShared(memctx, loc, column_name));
+        }
+
+        // Clear the primary key operations. They be filled after the primary key is fetched from
+        // the index.
+        key_where_ops_.clear();
+        std::remove_if(where_ops_.begin(), where_ops_.end(),
+                       [](const ColumnOp& op) { return op.desc()->is_primary(); });
+        const client::YBSchema& schema = table_->schema();
+        for (size_t i = 0; i < schema.num_key_columns(); i++) {
+          column_refs_.insert(schema.ColumnId(i));
+        }
+      }
+
+      // Create a child select statement to query the index.
+      child_select_ = MakeShared(memctx, *this, selected_exprs,
+                                 selectivity.index_id(), selectivity.covers_fully());
+
+      // If an index will be used, the limit and offset clauses should be used by the select from
+      // the index only.
+      order_by_clause_ = nullptr;
+      limit_clause_ = nullptr;
+      offset_clause_ = nullptr;
+
+      // Now analyze the select from the index.
+      return child_select_->Analyze(sem_context);
+    }
+    break;
   }
 
   return Status::OK();
@@ -440,6 +526,22 @@ CHECKED_STATUS PTSelectStmt::AnalyzeDistinctClause(SemContext *sem_context) {
   return Status::OK();
 }
 
+bool PTSelectStmt::IsReadableByAllSystemTable() const {
+  const client::YBTableName t = table_name();
+  const string& keyspace = t.namespace_name();
+  const string& table = t.table_name();
+  if (keyspace == master::kSystemSchemaNamespaceName) {
+    return true;
+  } else if (keyspace == master::kSystemNamespaceName) {
+    if (table == master::kSystemLocalTableName ||
+        table == master::kSystemPeersTableName ||
+        table == master::kSystemPartitionsTableName) {
+      return true;
+    }
+  }
+  return false;
+}
+
 //--------------------------------------------------------------------------------------------------
 
 namespace {
@@ -450,7 +552,6 @@ PTOrderBy::Direction directionFromSortingType(ColumnSchema::SortingType sorting_
 }
 
 } // namespace
-
 
 CHECKED_STATUS PTSelectStmt::AnalyzeOrderByClause(SemContext *sem_context) {
   if (order_by_clause_ != nullptr) {

@@ -23,9 +23,14 @@ import com.datastax.driver.core.ColumnDefinitions.Definition;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSetFuture;
 import com.datastax.driver.core.Row;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.TableMetadata;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
+
+import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.RocksDBMetrics;
 
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertFalse;
@@ -43,7 +48,7 @@ public class TestIndex extends BaseCQLTest {
 
   @BeforeClass
   public static void SetUpBeforeClass() throws Exception {
-    BaseCQLTest.tserverArgs = Arrays.asList("--allow_index_table_read_write");
+    BaseMiniClusterTest.tserverArgs.add("--allow_index_table_read_write");
     BaseCQLTest.setUpBeforeClass();
   }
 
@@ -74,6 +79,8 @@ public class TestIndex extends BaseCQLTest {
     // Create test indexes with range and non-primary-key columns.
     session.execute("create index i1 on test_create_index (r1, r2) include (c1, c4);");
     session.execute("create index i2 on test_create_index (c4) include (c1, c2);");
+    session.execute("create index i4 on test_create_index (c5) include (c4);");
+    session.execute("create index i5 on test_create_index (c1, c5) include (c2, c3);");
 
     // Wait to ensure the partitions metadata was updated.
     // Schema change should trigger a refresh but playing it safe in case debouncer will delay it.
@@ -86,10 +93,16 @@ public class TestIndex extends BaseCQLTest {
                  table.getIndex("i1").asCQLQuery());
     assertEquals("CREATE INDEX i2 ON cql_test_keyspace.test_create_index (c4, h1, h2, r1, r2);",
                  table.getIndex("i2").asCQLQuery());
+    assertEquals("CREATE INDEX i4 ON cql_test_keyspace.test_create_index (c5, h1, h2, r1, r2);",
+                 table.getIndex("i4").asCQLQuery());
+    assertEquals("CREATE INDEX i5 ON cql_test_keyspace.test_create_index (c1, c5, h1, h2, r1, r2);",
+                 table.getIndex("i5").asCQLQuery());
 
     // Verify the covering columns.
     assertIndexOptions("test_create_index", "i1", "r1, r2, h1, h2", "c1, c4");
     assertIndexOptions("test_create_index", "i2", "c4, h1, h2, r1, r2", "c1, c2");
+    assertIndexOptions("test_create_index", "i4", "c5, h1, h2, r1, r2", "c4");
+    assertIndexOptions("test_create_index", "i5", "c1, c5, h1, h2, r1, r2", "c2, c3");
 
     // Test retrieving non-existent index.
     assertNull(table.getIndex("i3"));
@@ -125,20 +138,6 @@ public class TestIndex extends BaseCQLTest {
     try {
       session.execute("create index i1 on test_create_index_2 (r1, r2) include (c1, c4);");
       fail("Index by the same name created on another table");
-    } catch (InvalidQueryException e) {
-      LOG.info("Expected exception " + e.getMessage());
-    }
-
-    try {
-      session.execute("create index i_invalid on test_create_index (c5);");
-      fail("Index with unsupported index column datatype created");
-    } catch (InvalidQueryException e) {
-      LOG.info("Expected exception " + e.getMessage());
-    }
-
-    try {
-      session.execute("create index i_invalid on test_create_index (c1, c5);");
-      fail("Index with unsupported index column datatype created");
     } catch (InvalidQueryException e) {
       LOG.info("Expected exception " + e.getMessage());
     }
@@ -516,7 +515,7 @@ public class TestIndex extends BaseCQLTest {
                     "primary key ((h1, h2), r1, r2)) " +
                     "with transactions = {'enabled' : true};");
     session.execute("create index i1 on test_prepare (h1);");
-    session.execute("create index i2 on test_prepare ((r1, r2));");
+    session.execute("create index i2 on test_prepare ((r1, r2)) include (c2);");
     session.execute("create index i3 on test_prepare (r2, r1);");
     session.execute("create index i4 on test_prepare (c1);");
     session.execute("create index i5 on test_prepare (c2) include (c1);");
@@ -531,9 +530,9 @@ public class TestIndex extends BaseCQLTest {
                            new Object[] {Integer.valueOf(1)},
                            "Row[1, a, 2, b]");
 
-    // Select using base table because i1 does not cover c1.
+    // Select using index i1 but as uncovered index.
     assertRoutingVariables("select h1, h2, r1, r2, c1 from test_prepare where h1 = ?;",
-                           null,
+                           Arrays.asList("i1.h1"),
                            new Object[] {Integer.valueOf(1)},
                            "Row[1, a, 2, b, 3]");
 
@@ -543,12 +542,13 @@ public class TestIndex extends BaseCQLTest {
                            new Object[] {"a"},
                            "Row[1, a, 2, b]");
 
-    // Select using index i2 because (r1, r2) is more selective than i1 alone.
-    assertRoutingVariables("select h1, h2, r1, r2 from test_prepare " +
+    // Select using index i2 because (r1, r2) is more selective than i1 alone. i3 is equally
+    // selective by i2 covers c2 also.
+    assertRoutingVariables("select h1, h2, r1, r2, c2 from test_prepare " +
                            "where h1 = ? and r1 = ? and r2 = ?;",
                            Arrays.asList("i2.r1", "i2.r2"),
                            new Object[] {Integer.valueOf(1), Integer.valueOf(2), "b"},
-                           "Row[1, a, 2, b]");
+                           "Row[1, a, 2, b, c]");
 
     // Select using index i3.
     assertRoutingVariables("select h1, h2, r1, r2 from test_prepare where h2 = ? and r2 = ?;",
@@ -655,7 +655,7 @@ public class TestIndex extends BaseCQLTest {
       int currentRestarts = getRestartsCount("test_restart");
       int currentRetries = getRetriesCount();
       LOG.info("Current restarts = {}, retries = {}", currentRestarts, currentRetries);
-      if (currentRestarts > initialRestarts && currentRetries > initialRetries)
+      if (currentRetries > initialRetries)
         break;
     }
 
@@ -669,8 +669,8 @@ public class TestIndex extends BaseCQLTest {
       fail("InvalidQueryException not thrown for " + query);
     } catch (InvalidQueryException e) {
       assertTrue(e.getMessage().startsWith(
-          String.format("SQL error: Execution Error. Duplicate value disallowed by unique index %s",
-                        indexName)));
+          String.format("Execution Error. Duplicate value disallowed by unique " +
+                        "index %s", indexName)));
     }
   }
 
@@ -741,6 +741,7 @@ public class TestIndex extends BaseCQLTest {
 
     // Restart the cluster
     miniCluster.restart();
+    Thread.sleep(MiniYBCluster.CQL_NODE_LIST_REFRESH_SECS * 1000);
     setUpCqlClient();
 
     // Test inserting duplicate h2 and r values again.
@@ -833,5 +834,201 @@ public class TestIndex extends BaseCQLTest {
     // Select all columns using index and verify the selected columns are returned in the same order
     // as the table columns.
     assertQuery("select * from test_all where v1 = 2;", "Row[1, 2, 3]");
+  }
+
+  @Test
+  public void testUncoveredIndex() throws Exception {
+    // Create test table and uncovered index.
+    session.execute("create table test_uncovered (h int, r int, v1 text, v2 int," +
+                    "  primary key ((h), r)) with transactions = {'enabled' : true};");
+    session.execute("create index test_uncovered_by_v1 on test_uncovered (v1);");
+
+    // Populate the table.
+    for (int h = 1; h <= 5; h++) {
+      for (int r = 1; r <= 100; r++) {
+        int val = (r == 3) ? 333 : h * 10 + r;
+        session.execute("insert into test_uncovered (h, r, v1, v2) values (?, ?, ?, ?);",
+                        h, r, "v" + val, val);
+      }
+    }
+
+    // Fetch by the indexed column. Verify that the index is used and no range scan happens as
+    // confirmed by the no. of next's.
+    RocksDBMetrics tableMetrics = getRocksDBMetric("test_uncovered");
+    RocksDBMetrics indexMetrics = getRocksDBMetric("test_uncovered_by_v1");
+    LOG.info("Initial: table {}, index {}", tableMetrics, indexMetrics);
+
+    assertQuery("select * from test_uncovered where v1 = 'v333';",
+                new HashSet<String>(Arrays.asList("Row[1, 3, v333, 333]",
+                                                  "Row[2, 3, v333, 333]",
+                                                  "Row[3, 3, v333, 333]",
+                                                  "Row[4, 3, v333, 333]",
+                                                  "Row[5, 3, v333, 333]")));
+
+    // Also verfiy select with limit and offset.
+    assertQuery("select * from test_uncovered where v1 = 'v333' offset 1 limit 3;",
+                new HashSet<String>(Arrays.asList("Row[2, 3, v333, 333]",
+                                                  "Row[3, 3, v333, 333]",
+                                                  "Row[4, 3, v333, 333]")));
+
+    tableMetrics = getRocksDBMetric("test_uncovered").subtract(tableMetrics);
+    indexMetrics = getRocksDBMetric("test_uncovered_by_v1").subtract(indexMetrics);
+    LOG.info("Difference: table {}, index {}", tableMetrics, indexMetrics);
+
+    // Verify that both the index and the primary table are read.
+    assertTrue(indexMetrics.nextCount > 0);
+    assertTrue(tableMetrics.nextCount > 0);
+
+    // Verify uncovered index query of non-existent indexed value.
+    assertQuery("select * from test_uncovered where v1 = 'nothing';", "");
+  }
+
+  @Test
+  public void testUncoveredIndexMisc() throws Exception {
+    // Create test table and index and populate with rows.
+    session.execute("create table test_misc (h int, r int, s int static, v1 int, v2 int," +
+                    "  primary key ((h), r)) with transactions = { 'enabled' : true };");
+    session.execute("create index test_misc_by_v1 on test_misc (v1);");
+
+    session.execute("insert into test_misc (h, r, s, v1, v2) values (1, 1, 2, 1, 11);");
+    session.execute("insert into test_misc (h, r, s, v1, v2) values (1, 2, 3, 2, 22);");
+    session.execute("insert into test_misc (h, r,    v1, v2) values (1, 3,    2, 33);");
+    session.execute("insert into test_misc (h, r, s, v1, v2) values (2, 1, 1, 1, 111);");
+    session.execute("insert into test_misc (h, r,    v1, v2) values (2, 2,    2, 222);");
+    session.execute("insert into test_misc (h, r,    v1, v2) values (3, 1,    2, 333);");
+
+    // Test select with static column.
+    assertQuery("select * from test_misc where v1 = 2;",
+                new HashSet<String>(Arrays.asList("Row[1, 2, 3, 2, 22]",
+                                                  "Row[1, 3, 3, 2, 33]",
+                                                  "Row[2, 2, 1, 2, 222]",
+                                                  "Row[3, 1, NULL, 2, 333]")));
+
+    // Test select with offset and limit.
+    assertQuery("select * from test_misc where v1 = 2 offset 2 limit 1;",
+                new HashSet<String>(Arrays.asList("Row[2, 2, 1, 2, 222]")));
+
+    // Test select with additional condition on non-indexed column.
+    assertQuery("select * from test_misc where v1 = 2 and v2 = 33;",
+                new HashSet<String>(Arrays.asList("Row[1, 3, 3, 2, 33]")));
+
+    // Test select with aggregate functions.
+    assertQuery("select sum(r), min(v2), max(v2), sum(v2) from test_misc where v1 = 2 and v2 > 30;",
+                new HashSet<String>(Arrays.asList("Row[6, 33, 333, 588]")));
+  }
+
+  @Test
+  public void testPagingSelect() throws Exception {
+    // Create test table and index.
+    session.execute("create table test_paging (h int, r int, v1 int, v2 varchar, " +
+                    "primary key (h, r)) with transactions = { 'enabled' : true };");
+    session.execute("create index test_paging_idx on test_paging (v1);");
+
+    // Populate rows.
+    session.execute("insert into test_paging (h, r, v1, v2) values (1, 1, 1, 'a');");
+    session.execute("insert into test_paging (h, r, v1, v2) values (1, 2, 2, 'b');");
+    session.execute("insert into test_paging (h, r, v1, v2) values (2, 1, 3, 'c');");
+    session.execute("insert into test_paging (h, r, v1, v2) values (2, 2, 4, 'd');");
+    session.execute("insert into test_paging (h, r, v1, v2) values (3, 1, 5, 'e');");
+    session.execute("insert into test_paging (h, r, v1, v2) values (3, 2, 6, 'f');");
+
+    // Execute uncovered select by index column with small page size.
+    assertQuery(new SimpleStatement("select * from test_paging where v1 in (3, 4, 5);")
+                .setFetchSize(1),
+                new HashSet<String>(Arrays.asList("Row[2, 1, 3, c]",
+                                                  "Row[2, 2, 4, d]",
+                                                  "Row[3, 1, 5, e]")));
+  }
+
+  @Test
+  public void testDropDuringWrite() throws Exception {
+    for (int i = 0; i != 5; ++i) {
+      String table_name = "index_test_" + i;
+      String index_name = "index_" + i;
+      session.execute(String.format(
+          "create table %s (h int, c int, primary key ((h))) " +
+          "with transactions = { 'enabled' : true };", table_name));
+      session.execute(String.format("create index %s on %s (c);", index_name, table_name));
+      final PreparedStatement statement = session.prepare(String.format(
+          "insert into %s (h, c) values (?, ?);", table_name));
+
+      List<Thread> threads = new ArrayList<Thread>();
+      while (threads.size() != 10) {
+        Thread thread = new Thread(() -> {
+          int key = 0;
+          while (!Thread.interrupted()) {
+            session.execute(statement.bind(Integer.valueOf(key), Integer.valueOf(-key)));
+            ++key;
+          }
+        });
+        thread.start();
+        threads.add(thread);
+      }
+      try {
+        Thread.sleep(5000);
+        session.execute(String.format("drop table %s;", table_name));
+      } finally {
+        for (Thread thread : threads) {
+          thread.interrupt();
+        }
+        for (Thread thread : threads) {
+          thread.join();
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testOrderBy() throws Exception {
+    session.execute("CREATE TABLE test_order (a text," +
+                    "                         b text," +
+                    "                         c int," +
+                    "                         PRIMARY KEY (a, b))" +
+                    "  WITH CLUSTERING ORDER BY (b ASC) AND default_time_to_live = 0;");
+
+    session.execute("CREATE INDEX test_order_index ON test_order (b, c)" +
+                    "  INCLUDE (a)" +
+                    "  WITH CLUSTERING ORDER BY (c DESC)" +
+                    "    AND transactions = { 'enabled' : FALSE, " +
+                    "                         'consistency_level' : 'user_enforced' };");
+
+    // rowDesc is the query result in descending order, rowAsc, ascending.
+    String rowDesc = "";
+    String rowAsc = "";
+
+    int rowCount = 10;
+    String a;
+    String b = "index_hash";
+    int cMax = 100;
+    int cDesc;
+    int cAsc = cMax - rowCount;
+
+    // INSERT rows to be selected with order by.
+    for (int i = 0; i < rowCount; i++) {
+      cDesc = cMax - i;
+      a = String.format("a_%d", cDesc);
+      rowDesc += String.format("Row[%s, %s, %d]", a, b, cDesc);
+      session.execute(String.format("INSERT INTO test_order (a, b, c) VALUES('%s', '%s', %d);",
+                                    a, b, cDesc));
+
+      cAsc++;
+      a = String.format("a_%d", cAsc);
+      rowAsc += String.format("Row[%s, %s, %d]", a, b, cAsc);
+    }
+
+    // INSERT dummy rows that shouldn't be filtered out by the query.
+    b = "dummy";
+    cDesc = 100;
+    for (int i = 0; i < rowCount; i++) {
+      cDesc = cMax - i;
+      a = String.format("a_%d", cDesc);
+      session.execute(String.format("INSERT INTO test_order (a, b, c) VALUES('%s', '%s', %d);",
+                                    a, b, cDesc));
+    }
+
+    // Asserting query result.
+    assertQuery("SELECT * FROM test_order WHERE b = 'index_hash';", rowDesc);
+    assertQuery("SELECT * FROM test_order WHERE b = 'index_hash' ORDER BY c DESC;", rowDesc);
+    assertQuery("SELECT * FROM test_order WHERE b = 'index_hash' ORDER BY c ASC;", rowAsc);
   }
 }

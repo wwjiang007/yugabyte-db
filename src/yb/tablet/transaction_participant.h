@@ -30,10 +30,13 @@
 
 #include "yb/consensus/opid_util.h"
 
+#include "yb/docdb/doc_key.h"
+
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/server/server_fwd.h"
 
+#include "yb/util/async_util.h"
 #include "yb/util/opid.pb.h"
 #include "yb/util/result.h"
 
@@ -61,7 +64,7 @@ class TransactionIntentApplier;
 class UpdateTxnOperationState;
 
 struct TransactionApplyData {
-  ProcessingMode mode;
+  int64_t leader_term;
   TransactionId transaction_id;
   consensus::OpId op_id;
   HybridTime commit_ht;
@@ -77,7 +80,7 @@ class TransactionIntentApplier {
   virtual CHECKED_STATUS ApplyIntents(const TransactionApplyData& data) = 0;
   virtual CHECKED_STATUS RemoveIntents(const TransactionId& transaction_id) = 0;
   virtual CHECKED_STATUS RemoveIntents(const TransactionIdSet& transactions) = 0;
-  virtual HybridTime ApplierSafeTime(HybridTime min_allowed, MonoTime deadline) = 0;
+  virtual HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) = 0;
 
  protected:
   ~TransactionIntentApplier() {}
@@ -85,14 +88,16 @@ class TransactionIntentApplier {
 
 class TransactionParticipantContext {
  public:
+  virtual const std::string& permanent_uuid() const = 0;
   virtual const std::string& tablet_id() const = 0;
-  virtual const std::shared_future<client::YBClientPtr>& client_future() const = 0;
+  virtual const std::shared_future<client::YBClient*>& client_future() const = 0;
   virtual const server::ClockPtr& clock_ptr() const = 0;
-  virtual rpc::ThreadPool& thread_pool() = 0;
+  virtual bool Enqueue(rpc::ThreadPoolTask* task) = 0;
   virtual HybridTime Now() = 0;
   virtual void UpdateClock(HybridTime hybrid_time) = 0;
   virtual bool IsLeader() = 0;
-  virtual void SubmitUpdateTransaction(std::unique_ptr<UpdateTxnOperationState> state) = 0;
+  virtual void SubmitUpdateTransaction(
+      std::unique_ptr<UpdateTxnOperationState> state, int64_t term) = 0;
 
  protected:
   ~TransactionParticipantContext() {}
@@ -103,11 +108,14 @@ class TransactionParticipantContext {
 // instance per tablet.
 class TransactionParticipant : public TransactionStatusManager {
  public:
-  TransactionParticipant(TransactionParticipantContext* context, TransactionIntentApplier* applier);
+  TransactionParticipant(
+      TransactionParticipantContext* context, TransactionIntentApplier* applier,
+      const scoped_refptr<MetricEntity>& entity);
   virtual ~TransactionParticipant();
 
   // Adds new running transaction.
-  void Add(const TransactionMetadataPB& data, rocksdb::WriteBatch *write_batch);
+  void Add(const TransactionMetadataPB& data, bool may_have_metadata,
+           rocksdb::WriteBatch *write_batch);
 
   boost::optional<TransactionMetadata> Metadata(const TransactionId& id) override;
 
@@ -122,7 +130,7 @@ class TransactionParticipant : public TransactionStatusManager {
 
   void Abort(const TransactionId& id, TransactionStatusCallback callback) override;
 
-  void Handle(std::unique_ptr<tablet::UpdateTxnOperationState> request);
+  void Handle(std::unique_ptr<tablet::UpdateTxnOperationState> request, int64_t term);
 
   void Cleanup(TransactionIdSet&& set) override;
 
@@ -130,7 +138,7 @@ class TransactionParticipant : public TransactionStatusManager {
 
   // Used to pass arguments to ProcessReplicated.
   struct ReplicatedData {
-    ProcessingMode mode;
+    int64_t leader_term;
     const tserver::TransactionStatePB& state;
     const consensus::OpId& op_id;
     HybridTime hybrid_time;
@@ -139,7 +147,7 @@ class TransactionParticipant : public TransactionStatusManager {
 
   CHECKED_STATUS ProcessReplicated(const ReplicatedData& data);
 
-  void SetDB(rocksdb::DB* db);
+  void SetDB(rocksdb::DB* db, const docdb::KeyBounds* key_bounds);
 
   TransactionParticipantContext* context() const;
 

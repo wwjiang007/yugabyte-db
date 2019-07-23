@@ -45,6 +45,8 @@
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/log-test-base.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/replicate_msgs_holder.h"
+
 #include "yb/fs/fs_manager.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/util/metrics.h"
@@ -65,6 +67,8 @@ static const char* kPeerUuid = "peer-1";
 static const char* kTestTable = "test-table";
 static const char* kTestTablet = "test-tablet";
 
+constexpr int kNumMessages = 100;
+
 class ConsensusQueueTest : public YBTest {
  public:
   ConsensusQueueTest()
@@ -81,9 +85,9 @@ class ConsensusQueueTest : public YBTest {
     ASSERT_OK(fs_manager_->Open());
     ASSERT_OK(ThreadPoolBuilder("append").Build(&append_pool_));
     ASSERT_OK(log::Log::Open(log::LogOptions(),
-                            fs_manager_.get(),
                             kTestTablet,
                             fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet),
+                            fs_manager_->uuid(),
                             schema_,
                             0, // schema_version
                             NULL,
@@ -103,6 +107,7 @@ class ConsensusQueueTest : public YBTest {
     queue_.reset();
     queue_.reset(new PeerMessageQueue(metric_entity_,
                                       log_.get(),
+                                      nullptr /* server_tracker */,
                                       FakeRaftPeerPB(kLeaderUuid),
                                       kTestTablet,
                                       clock_,
@@ -115,10 +120,8 @@ class ConsensusQueueTest : public YBTest {
   }
 
   Status AppendReplicateMsg(int term, int index, int payload_size) {
-    return queue_->AppendOperation(CreateDummyReplicate(term,
-                                                        index,
-                                                        clock_->Now(),
-                                                        payload_size));
+    return queue_->TEST_AppendOperation(CreateDummyReplicate(
+        term, index, clock_->Now(), payload_size));
   }
 
   // Updates the peer's watermark in the queue so that it matches
@@ -137,7 +140,7 @@ class ConsensusQueueTest : public YBTest {
 
     // Ask for a request. The queue assumes the peer is up-to-date so this should contain no
     // operations.
-    ReplicateMsgs refs;
+    ReplicateMsgsHolder refs;
     bool needs_remote_bootstrap;
     ASSERT_OK(queue_->RequestForPeer(kPeerUuid, request, &refs, &needs_remote_bootstrap));
     ASSERT_FALSE(needs_remote_bootstrap);
@@ -237,8 +240,8 @@ TEST_F(ConsensusQueueTest, TestStartTrackingAfterStart) {
   response.set_responder_uuid(kPeerUuid);
   bool more_pending = false;
 
-  // Peer already has some messages, last one being 7.50
-  OpId last_received = MakeOpId(7, 50);
+  // Peer already has some messages, last one being index (kNumMessages / 2)
+  OpId last_received = MakeOpIdForIndex(kNumMessages / 2);
   OpId last_received_current_leader = MinimumOpId();
 
   UpdatePeerWatermarkToOp(&request, &response, last_received,
@@ -246,23 +249,21 @@ TEST_F(ConsensusQueueTest, TestStartTrackingAfterStart) {
   ASSERT_TRUE(more_pending);
 
   // Getting a new request should get all operations after 7.50
-  ReplicateMsgs refs;
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
-  ASSERT_EQ(50, request.ops_size());
+  ASSERT_EQ(kNumMessages / 2, request.ops_size());
 
-  SetLastReceivedAndLastCommitted(&response, request.ops(49).id());
+  SetLastReceivedAndLastCommitted(&response, request.ops((kNumMessages / 2) - 1).id());
   queue_->ResponseFromPeer(response.responder_uuid(), response, &more_pending);
   ASSERT_FALSE(more_pending) << "Queue still had requests pending";
 
   // if we ask for a new request, it should come back empty
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_EQ(0, request.ops_size());
-
-  // extract the ops from the request to avoid double free
-  request.mutable_ops()->ExtractSubrange(0, request.ops_size(), nullptr);
 }
 
 // Tests that the peers gets the messages pages, with the size of a page being
@@ -324,13 +325,9 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
   OpId last;
   for (int i = 0; i < 11; i++) {
     VLOG(1) << "Making request " << i;
-    ReplicateMsgs refs;
+    ReplicateMsgsHolder refs;
     bool needs_remote_bootstrap;
     ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
-    BOOST_SCOPE_EXIT(&request) {
-      // Extract the ops from the request to avoid double free.
-      request.mutable_ops()->ExtractSubrange(0, request.ops_size(), /* elements */ nullptr);
-    } BOOST_SCOPE_EXIT_END;
 
     ASSERT_FALSE(needs_remote_bootstrap);
     LOG(INFO) << "Number of ops in request: " << request.ops_size();
@@ -341,13 +338,9 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
     queue_->ResponseFromPeer(response.responder_uuid(), response, &more_pending);
     ASSERT_TRUE(more_pending);
   }
-  ReplicateMsgs refs;
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
-  BOOST_SCOPE_EXIT(&request) {
-    // Extract the ops from the request to avoid double free.
-    request.mutable_ops()->ExtractSubrange(0, request.ops_size(), /* elements */ nullptr);
-  } BOOST_SCOPE_EXIT_END;
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_EQ(1, request.ops_size());
   last = request.ops(request.ops_size() - 1).id();
@@ -359,21 +352,21 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
 TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
   queue_->Init(MinimumOpId());
   queue_->SetLeaderMode(MinimumOpId(), MinimumOpId().term(), BuildRaftConfigPBForTests(3));
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, kNumMessages);
 
   // Wait for the local peer to append all messages
-  WaitForLocalPeerToAckIndex(100);
+  WaitForLocalPeerToAckIndex(kNumMessages);
 
-  OpId all_replicated = MakeOpId(14, 100);
+  OpId all_replicated = MakeOpIdForIndex(kNumMessages);
 
   ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MinimumOpId());
   // Since we're tracking a single peer still this should have moved the all
   // replicated watermark to the last op appended to the local log.
-  ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpId(14, 100));
+  ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpIdForIndex(kNumMessages));
 
   // Start to track the peer after the queue has some messages in it
   // at a point that is halfway through the current messages in the queue.
-  OpId first_msg = MakeOpId(7, 50);
+  OpId first_msg = MakeOpIdForIndex(kNumMessages / 2);
 
   ConsensusRequestPB request;
   ConsensusResponsePB response;
@@ -387,29 +380,30 @@ TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
   ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MinimumOpId());
   ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MinimumOpId());
 
-  ReplicateMsgs refs;
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
-  ASSERT_EQ(50, request.ops_size());
+  ASSERT_EQ(kNumMessages / 2, request.ops_size());
 
-  AppendReplicateMessagesToQueue(queue_.get(), clock_, 101, 100);
+  AppendReplicateMessagesToQueue(queue_.get(), clock_, 101, kNumMessages);
 
-  SetLastReceivedAndLastCommitted(&response, request.ops(49).id());
+  SetLastReceivedAndLastCommitted(&response, request.ops((kNumMessages / 2) - 1).id());
   response.set_responder_term(28);
 
   queue_->ResponseFromPeer(response.responder_uuid(), response, &more_pending);
   ASSERT_TRUE(more_pending) << "Queue didn't have anymore requests pending";
 
-  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpId(14, 100));
-  ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpId(14, 100));
+  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpIdForIndex(kNumMessages));
+  ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpIdForIndex(kNumMessages));
 
   // if we ask for a new request, it should come back with the rest of the messages
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
-  ASSERT_EQ(100, request.ops_size());
+  ASSERT_EQ(kNumMessages, request.ops_size());
 
-  OpId expected = request.ops(99).id();
+  OpId expected = request.ops(kNumMessages - 1).id();
 
   SetLastReceivedAndLastCommitted(&response, expected);
   response.set_responder_term(expected.term());
@@ -420,9 +414,6 @@ TEST_F(ConsensusQueueTest, TestPeersDontAckBeyondWatermarks) {
 
   ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), expected);
   ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), expected);
-
-  // extract the ops from the request to avoid double free
-  request.mutable_ops()->ExtractSubrange(0, request.ops_size(), nullptr);
 }
 
 TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
@@ -450,7 +441,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   response.set_responder_term(1);
 
   bool more_pending;
-  OpId last_sent = MakeOpId(0, 5);
+  OpId last_sent = MakeOpIdForIndex(5);
 
   // Ack the first five operations for peer-1
   response.set_responder_uuid("peer-1");
@@ -470,11 +461,11 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
 
   // A majority has now replicated up to 0.5.
   queue_->raft_pool_observers_token_->Wait();
-  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpId(0, 5));
+  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpIdForIndex(5));
 
   // Ack all operations for peer-3
   response.set_responder_uuid("peer-3");
-  last_sent = MakeOpId(1, 10);
+  last_sent = MakeOpIdForIndex(10);
   SetLastReceivedAndLastCommitted(&response, last_sent, MinimumOpId().index());
 
   queue_->ResponseFromPeer(response.responder_uuid(), response, &more_pending);
@@ -483,7 +474,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   ASSERT_TRUE(more_pending);
 
   // Majority replicated watermark should be the same
-  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpId(0, 5));
+  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpIdForIndex(5));
 
   // Ack the remaining operations for peer-4
   response.set_responder_uuid("peer-4");
@@ -493,7 +484,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   // Now that a majority of peers have replicated an operation in the queue's
   // term the committed index should advance.
   queue_->raft_pool_observers_token_->Wait();
-  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpId(1, 10));
+  ASSERT_OPID_EQ(queue_->GetMajorityReplicatedOpIdForTests(), MakeOpIdForIndex(10));
 }
 
 // In this test we append a sequence of operations to a log
@@ -549,14 +540,11 @@ TEST_F(ConsensusQueueTest, TestQueueLoadsOperationsForPeer) {
 
   // When we get another request for the peer the queue should load
   // the missing operations.
-  ReplicateMsgs refs;
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_EQ(request.ops_size(), 50);
-
-  // The messages still belong to the queue so we have to release them.
-  request.mutable_ops()->ExtractSubrange(0, request.ops().size(), nullptr);
 }
 
 // This tests that the queue is able to handle operation overwriting, i.e. when a
@@ -601,7 +589,6 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
   // and send it operations starting at the old leader's committed index.
   ConsensusRequestPB request;
   ConsensusResponsePB response;
-  ReplicateMsgs refs;
   response.set_responder_uuid(kPeerUuid);
   bool more_pending = false;
 
@@ -609,6 +596,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
 
   // Ask for a request. The queue assumes the peer is up-to-date so
   // this should contain no operations.
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
@@ -642,13 +630,14 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
   // Test even when a correct peer responds (meaning we actually get to execute
   // watermark advancement) we sill have the same all-replicated watermark.
   auto replicate = CreateDummyReplicate(2, 21, clock_->Now(), 0);
-  ASSERT_OK(queue_->AppendOperation(replicate));
+  ASSERT_OK(queue_->TEST_AppendOperation(replicate));
   WaitForLocalPeerToAckIndex(21);
 
   ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MinimumOpId());
 
   // Generate another request for the remote peer, which should include
   // all of the ops since the peer's last-known committed index.
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_OPID_EQ(MakeOpId(1, 5), request.preceding_id());
@@ -661,15 +650,13 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
 
   // Now the watermark should have advanced.
   ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpId(2, 21));
-
-  // The messages still belong to the queue so we have to release them.
-  request.mutable_ops()->ExtractSubrange(0, request.ops().size(), nullptr);
 }
 
 // Test for a bug where we wouldn't move any watermark back, when overwriting
 // operations, which would cause a check failure on the write immediately
 // following the overwriting write.
 TEST_F(ConsensusQueueTest, TestQueueMovesWatermarksBackward) {
+  RestartSafeCoarseMonoClock restart_safe_coarse_mono_clock;
   queue_->Init(MinimumOpId());
   queue_->SetNonLeaderMode();
   // Append a bunch of messages.
@@ -677,26 +664,26 @@ TEST_F(ConsensusQueueTest, TestQueueMovesWatermarksBackward) {
   ASSERT_OK(log_->WaitUntilAllFlushed());
   ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpId(1, 10));
   // Now rewrite some of the operations and wait for the log to append.
-  Synchronizer synch;
   ASSERT_OK(queue_->AppendOperations(
-      { CreateDummyReplicate(2, 5, clock_->Now(), 0) },
-      synch.AsStatusCallback()));
+      { CreateDummyReplicate(2, 5, clock_->Now(), 0) }, yb::OpId() /* committed_op_id */,
+        restart_safe_coarse_mono_clock.Now()));
 
   // Wait for the operation to be in the log.
-  ASSERT_OK(synch.Wait());
+  log_->WaitForSafeOpIdToApply(yb::OpId(2, 5));
 
   // Without the fix the following append would trigger a check failure
   // in log cache.
-  synch.Reset();
   ASSERT_OK(queue_->AppendOperations(
-      { CreateDummyReplicate(2, 6, clock_->Now(), 0) },
-      synch.AsStatusCallback()));
+      { CreateDummyReplicate(2, 6, clock_->Now(), 0) }, yb::OpId() /* committed_op_id */,
+      restart_safe_coarse_mono_clock.Now()));
 
   // Wait for the operation to be in the log.
-  ASSERT_OK(synch.Wait());
+  log_->WaitForSafeOpIdToApply(yb::OpId(2, 6));
 
   // Now the all replicated watermark should have moved backward.
-  ASSERT_OPID_EQ(queue_->GetAllReplicatedIndexForTests(), MakeOpId(2, 6));
+  ASSERT_OK(WaitFor(
+        [this]() { return OpIdEquals(queue_->GetAllReplicatedIndexForTests(), MakeOpId(2, 6)); },
+        1s, "AllReplicatedOpIdForTests", 10ms));
 }
 
 // Tests that we're advancing the watermarks properly and only when the peer
@@ -732,7 +719,6 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 
   ConsensusRequestPB request;
   ConsensusResponsePB response;
-  ReplicateMsgs refs;
 
   bool more_pending;
   // We expect the majority replicated watermark to star at the committed index.
@@ -762,6 +748,7 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 
   // When we get operations for this peer we should get them starting immediately after
   // the committed index, for a total of 9 operations.
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
@@ -784,7 +771,7 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 
   // Another request for this peer should get another page of messages. Still not
   // on the queue's term (and thus without advancing watermarks).
-  request.mutable_ops()->ExtractSubrange(0, request.ops().size(), nullptr);
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_EQ(request.ops_size(), 9);
@@ -803,7 +790,7 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 
   // The last page of request should overwrite the peer's operations and the
   // response should finally advance the watermarks.
-  request.mutable_ops()->ExtractSubrange(0, request.ops().size(), nullptr);
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
   ASSERT_EQ(request.ops_size(), 4);
@@ -835,7 +822,7 @@ TEST_F(ConsensusQueueTest, TestTriggerRemoteBootstrapIfTabletNotFound) {
   queue_->TrackPeer(kPeerUuid);
 
   // Create request for new peer.
-  ReplicateMsgs refs;
+  ReplicateMsgsHolder refs;
   bool needs_remote_bootstrap;
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_FALSE(needs_remote_bootstrap);
@@ -851,6 +838,7 @@ TEST_F(ConsensusQueueTest, TestTriggerRemoteBootstrapIfTabletNotFound) {
 
   // On the next request, we should find out that the queue wants us to remotely bootstrap.
   request.Clear();
+  refs.Reset();
   ASSERT_OK(queue_->RequestForPeer(kPeerUuid, &request, &refs, &needs_remote_bootstrap));
   ASSERT_TRUE(needs_remote_bootstrap);
 
@@ -862,6 +850,37 @@ TEST_F(ConsensusQueueTest, TestTriggerRemoteBootstrapIfTabletNotFound) {
   ASSERT_EQ(kLeaderUuid, rb_req.bootstrap_peer_uuid());
   ASSERT_EQ(FakeRaftPeerPB(kLeaderUuid).last_known_private_addr()[0].ShortDebugString(),
             rb_req.source_private_addr()[0].ShortDebugString());
+}
+
+// Tests that ReadReplicatedMessages() only reads messages until the last known
+// committed index.
+TEST_F(ConsensusQueueTest, TestReadReplicatedMessages) {
+  queue_->Init(MinimumOpId());
+  queue_->SetLeaderMode(MinimumOpId(), MinimumOpId().term(), BuildRaftConfigPBForTests(2));
+  AppendReplicateMessagesToQueue(queue_.get(), clock_, 1, kNumMessages);
+
+  // Wait for the local peer to append all messages.
+  WaitForLocalPeerToAckIndex(kNumMessages);
+
+  ConsensusResponsePB response;
+  response.set_responder_uuid(kLeaderUuid);
+  bool more_pending = false;
+
+  int last_committed_index = kNumMessages - 20;
+  // Peer already has some messages, last one being index last_committed_index.
+  SetLastReceivedAndLastCommitted(&response, MakeOpIdForIndex(last_committed_index));
+  queue_->ResponseFromPeer(response.responder_uuid(), response, &more_pending);
+  ASSERT_TRUE(more_pending);
+
+  ReplicateMsgs msgs;
+  ASSERT_OK(queue_->ReadReplicatedMessages(MakeOpIdForIndex(0), &msgs));
+  ASSERT_EQ(last_committed_index, msgs.size());
+  msgs.clear();
+
+  // Read from some index > 0
+  int start = 10;
+  ASSERT_OK(queue_->ReadReplicatedMessages(MakeOpIdForIndex(start), &msgs));
+  ASSERT_EQ(last_committed_index - start, msgs.size());
 }
 
 }  // namespace consensus

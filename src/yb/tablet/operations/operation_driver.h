@@ -35,10 +35,11 @@
 
 #include <string>
 
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_types.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/walltime.h"
 #include "yb/tablet/operations/operation.h"
+#include "yb/util/lockfree.h"
 #include "yb/util/status.h"
 #include "yb/util/trace.h"
 
@@ -103,7 +104,8 @@ class Preparer;
 //
 // This class is thread safe.
 class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
-                        public consensus::ConsensusAppendCallback {
+                        public consensus::ConsensusAppendCallback,
+                        public MPSCQueueEntry<OperationDriver> {
 
  public:
   // Construct OperationDriver. OperationDriver does not take ownership
@@ -117,7 +119,9 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   // Perform any non-constructor initialization. Sets the operation
   // that will be executed.
-  CHECKED_STATUS Init(std::unique_ptr<Operation>* operation, consensus::DriverType driver);
+  // if term == kUnknownTerm then we launch this operation as replica, otherwise
+  // we are leader and operation should be bound to this term.
+  CHECKED_STATUS Init(std::unique_ptr<Operation>* operation, int64_t term);
 
   // Returns the OpId of the operation being executed or an uninitialized
   // OpId if none has been assigned. Returns a copy and thus should not
@@ -141,7 +145,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // If status is anything different from OK() we don't proceed with the apply.
   //
   // see comment in the interface for an important TODO.
-  void ReplicationFinished(const Status& status);
+  void ReplicationFinished(const Status& status, int64_t leader_term);
 
   std::string ToString() const;
 
@@ -179,7 +183,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   void PrepareAndStartTask();
 
   // This should be called in case of a failure to submit the operation for replication.
-  void SetReplicationFailed(const Status& replication_status);
+  void ReplicationFailed(const Status& replication_status);
 
   // Handle a failure in any of the stages of the operation.
   // In some cases, this will end the operation and call its callback.
@@ -231,11 +235,11 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   bool StartOperation();
 
   // Performs status checks and calls ApplyTask.
-  CHECKED_STATUS ApplyOperation();
+  CHECKED_STATUS ApplyOperation(int64_t leader_term);
 
   // Calls Operation::Apply() followed by Consensus::Commit() with the
   // results from the Apply().
-  void ApplyTask();
+  void ApplyTask(int64_t leader_term);
 
   // Called on Operation::Apply() after the CommitMsg has been successfully
   // appended to the WAL.

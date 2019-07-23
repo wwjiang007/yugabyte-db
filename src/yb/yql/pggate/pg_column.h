@@ -20,32 +20,51 @@
 
 #include "yb/yql/pggate/pg_coldesc.h"
 #include "yb/yql/pggate/pg_expr.h"
+#include "yb/common/ql_expr.h"
 
 namespace yb {
 namespace pggate {
 
 class PgColumn {
  public:
+  // Constructor & Destructor.
   PgColumn();
+  virtual ~PgColumn() {
+  }
 
-  // Bindings.
+  // Initialize hidden columns.
+  void Init(PgSystemAttrNum attr_num);
+
+  // Bindings for write requests.
   PgsqlExpressionPB *AllocPrimaryBindPB(PgsqlWriteRequestPB *write_req);
   PgsqlExpressionPB *AllocBindPB(PgsqlWriteRequestPB *write_req);
 
-  PgsqlExpressionPB *AllocPartitionBindPB(PgsqlReadRequestPB *read_req);
+  // Bindings for read requests.
+  PgsqlExpressionPB *AllocPrimaryBindPB(PgsqlReadRequestPB *write_req);
   PgsqlExpressionPB *AllocBindPB(PgsqlReadRequestPB *read_req);
+
+  // Assign values for write requests.
+  PgsqlExpressionPB *AllocAssignPB(PgsqlWriteRequestPB *write_req);
 
   // Access functions.
   ColumnDesc *desc() {
     return &desc_;
   }
 
-  PgExpr *bind_expr() {
-    return bind_expr_;
+  const ColumnDesc *desc() const {
+    return &desc_;
   }
 
   PgsqlExpressionPB *bind_pb() {
     return bind_pb_;
+  }
+
+  PgsqlExpressionPB *assign_pb() {
+    return assign_pb_;
+  }
+
+  const string& attr_name() const {
+    return desc_.name();
   }
 
   int attr_num() const {
@@ -64,27 +83,26 @@ class PgColumn {
     return read_requested_;
   }
 
-  bool set_read_requested(bool value) {
-    return read_requested_ = value;
+  void set_read_requested(const bool value) {
+    read_requested_ = value;
   }
 
   bool write_requested() const {
     return write_requested_;
   }
 
-  bool set_write_requested(bool value) {
-    return write_requested_ = value;
+  void set_write_requested(const bool value) {
+    write_requested_ = value;
   }
+
+  bool is_system_column() {
+    return attr_num() < 0;
+  }
+
+  bool is_virtual_column();
 
  private:
   ColumnDesc desc_;
-
-  // Column associated values (expressions) to be used by DML statements.
-  // - When expression are constructed, we bind them with their associated columns in a statement.
-  // - These expressions might not yet have values for place_holders or literals.
-  // - During execution, the place_holder values are available, and the statement protobuf will
-  //   be updated with these values before sending over to DocDB.
-  PgExpr *bind_expr_ = nullptr;
 
   // Protobuf code.
   // Input binds. For now these are just literal values of the columns.
@@ -96,10 +114,13 @@ class PgColumn {
   // - The data-member "primary_exprs" is to map column id with the reserved expression spaces.
   PgsqlExpressionPB *bind_pb_ = nullptr;
 
+  // Protobuf for new-values of a column in the tuple.
+  PgsqlExpressionPB *assign_pb_ = nullptr;
+
   // Wether or not this column must be read from DB for the SQL request.
   bool read_requested_ = false;
 
-  // Wether or not this column must be written into DB for the SQL request.
+  // Wether or not this column will be written for the request.
   bool write_requested_ = false;
 };
 

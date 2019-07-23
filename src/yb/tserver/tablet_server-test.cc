@@ -190,7 +190,6 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablets", addr),
                        &buf));
   ASSERT_STR_CONTAINS(buf.ToString(), kTabletId);
-  ASSERT_STR_CONTAINS(buf.ToString(), "<td>hash_split: [&lt;start&gt;, &lt;end&gt;)</td>");
 
   // Tablet page should include the schema.
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet?id=$1", addr, kTabletId),
@@ -213,7 +212,6 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     // Check that the tablet entry shows up.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
     ASSERT_STR_CONTAINS(buf.ToString(), "\"id\": \"test-tablet\"");
-    ASSERT_STR_CONTAINS(buf.ToString(), "\"partition\": \"hash_split: [<start>, <end>)\"");
 
     // Check entity attributes.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"table_name\": \"test-table\"");
@@ -517,10 +515,11 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
 
   // Save the log path before shutting down the tablet (and destroying
   // the tablet peer).
-  string log_path = tablet_peer_->log()->ActiveSegmentPathForTests();
-  ShutdownTablet();
+  string log_path = tablet_peer_->log()->ActiveSegmentForTests()->path();
+  auto idx = tablet_peer_->log()->ActiveSegmentForTests()->first_entry_offset() + 300;
 
-  ASSERT_OK(log::CorruptLogFile(env_.get(), log_path, log::FLIP_BYTE, 300));
+  ShutdownTablet();
+  ASSERT_OK(log::CorruptLogFile(env_.get(), log_path, log::FLIP_BYTE, idx));
 
   ASSERT_FALSE(ShutdownAndRebuildTablet().ok());
 
@@ -553,7 +552,7 @@ TEST_F(TabletServerTest, TestCreateTablet_TabletExists) {
   req.mutable_config()->CopyFrom(mini_server_->CreateLocalConfig());
 
   Schema schema = SchemaBuilder(schema_).Build();
-  ASSERT_OK(SchemaToPB(schema, req.mutable_schema()));
+  SchemaToPB(schema, req.mutable_schema());
 
   // Send the call
   {
@@ -726,12 +725,13 @@ TEST_F(TabletServerTest, TestRpcServerCreateDestroy) {
         "server1", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
   }
   {
-    server::RpcServer server2(
-        "server2", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
     MessengerBuilder mb("foo");
-    auto messenger = mb.Build();
-    ASSERT_OK(messenger);
-    ASSERT_OK(server2.Init(*messenger));
+    auto messenger = ASSERT_RESULT(mb.Build());
+    {
+      server::RpcServer server2(
+          "server2", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
+      ASSERT_OK(server2.Init(messenger.get()));
+    }
   }
 }
 
@@ -742,27 +742,26 @@ TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
   ServerRegistrationPB reg;
   auto tbo = ASSERT_RESULT(TabletServerOptions::CreateTabletServerOptions());
   MessengerBuilder mb("foo");
-  auto messenger = mb.Build();
-  ASSERT_OK(messenger);
+  auto messenger = ASSERT_RESULT(mb.Build());
 
   server::RpcServer server1(
       "server1", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server1.Init(*messenger));
+  ASSERT_OK(server1.Init(messenger.get()));
 
   FLAGS_rpc_bind_addresses = "0.0.0.0:2000,0.0.0.1:2001";
   server::RpcServerOptions opts2;
   server::RpcServer server2(
       "server2", opts2, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server2.Init(*messenger));
+  ASSERT_OK(server2.Init(messenger.get()));
 
   FLAGS_rpc_bind_addresses = "10.20.30.40:2017";
   server::RpcServerOptions opts3;
   server::RpcServer server3(
       "server3", opts3, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
-  ASSERT_OK(server3.Init(*messenger));
+  ASSERT_OK(server3.Init(messenger.get()));
 
   reg.Clear();
-  tbo.fs_opts.data_paths = { "/tmp" };
+  tbo.fs_opts.data_paths = { GetTestPath("fake-ts") };
   tbo.rpc_opts = opts3;
   YB_EDITION_NS_PREFIX TabletServer server(tbo);
 

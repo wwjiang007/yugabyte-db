@@ -19,6 +19,8 @@
 
 #include <vector>
 
+#include "yb/client/client_fwd.h"
+
 #include "yb/yql/cql/cqlserver/cql_message.h"
 #include "yb/yql/cql/cqlserver/cql_processor.h"
 #include "yb/yql/cql/cqlserver/cql_statement.h"
@@ -31,12 +33,6 @@
 #include "yb/client/async_initializer.h"
 
 namespace yb {
-
-namespace client {
-class YBClient;
-class YBTable;
-class YBSession;
-}  // namespace client
 
 namespace cqlserver {
 
@@ -54,6 +50,7 @@ class CQLServiceImpl : public CQLServerServiceIf,
   // Constructor.
   CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
                  client::LocalTabletFilter local_tablet_filter);
+  ~CQLServiceImpl();
 
   void CompleteInit();
 
@@ -83,7 +80,7 @@ class CQLServiceImpl : public CQLServerServiceIf,
   }
 
   // Return the YBClient to communicate with either master or tserver.
-  const std::shared_ptr<client::YBClient>& client() const;
+  client::YBClient* client() const;
 
   // Return the YBClientCache.
   const std::shared_ptr<client::YBMetaDataCache>& metadata_cache() const;
@@ -92,9 +89,9 @@ class CQLServiceImpl : public CQLServerServiceIf,
   std::shared_ptr<CQLMetrics> cql_metrics() const { return cql_metrics_; }
 
   // Return the messenger.
-  std::weak_ptr<rpc::Messenger> messenger() { return messenger_; }
+  rpc::Messenger* messenger() { return messenger_; }
 
-  client::TransactionManager* GetTransactionManager();
+  client::TransactionPool* GetTransactionPool();
 
   server::Clock* clock();
 
@@ -159,13 +156,14 @@ class CQLServiceImpl : public CQLServerServiceIf,
 
   std::shared_ptr<CQLMetrics> cql_metrics_;
   // Used to requeue the cql_inbound call to handle the response callback(s).
-  std::weak_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
 
   client::LocalTabletFilter local_tablet_filter_;
 
-  std::atomic<client::TransactionManager*> transaction_manager_{nullptr};
-  std::mutex transaction_manager_mutex_;
+  std::atomic<client::TransactionPool*> transaction_pool_{nullptr};
+  std::mutex transaction_pool_mutex_;
   std::unique_ptr<client::TransactionManager> transaction_manager_holder_;
+  std::unique_ptr<client::TransactionPool> transaction_pool_holder_;
 };
 
 }  // namespace cqlserver

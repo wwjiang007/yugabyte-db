@@ -25,6 +25,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/hybrid_time.h"
 
+#include "yb/util/async_util.h"
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
 #include "yb/util/logging.h"
@@ -46,11 +47,6 @@ using TransactionIdSet = std::unordered_set<TransactionId, TransactionIdHash>;
 
 inline TransactionId GenerateTransactionId() { return Uuid::Generate(); }
 
-// Processing mode:
-//   LEADER - processing in leader.
-//   NON_LEADER - processing in non leader.
-YB_DEFINE_ENUM(ProcessingMode, (NON_LEADER)(LEADER));
-
 // Decodes transaction id from its binary representation.
 // Checks that slice contains only TransactionId.
 Result<TransactionId> FullyDecodeTransactionId(const Slice& slice);
@@ -68,6 +64,12 @@ struct TransactionStatusResult {
   // COMMITTED - status_time is a commit time.
   // ABORTED - not used.
   HybridTime status_time;
+
+  TransactionStatusResult(TransactionStatus status_, HybridTime status_time_);
+
+  static TransactionStatusResult Aborted() {
+    return TransactionStatusResult(TransactionStatus::ABORTED, HybridTime());
+  }
 };
 
 inline std::ostream& operator<<(std::ostream& out, const TransactionStatusResult& result) {
@@ -78,7 +80,8 @@ inline std::ostream& operator<<(std::ostream& out, const TransactionStatusResult
 typedef std::function<void(Result<TransactionStatusResult>)> TransactionStatusCallback;
 struct TransactionMetadata;
 
-YB_STRONGLY_TYPED_BOOL(MustExist);
+YB_DEFINE_ENUM(TransactionLoadFlag, (kMustExist)(kCleanup));
+typedef EnumBitSet<TransactionLoadFlag> TransactionLoadFlags;
 
 // Used by RequestStatusAt.
 struct StatusRequest {
@@ -87,7 +90,7 @@ struct StatusRequest {
   HybridTime global_limit_ht;
   int64_t serial_no;
   const std::string* reason;
-  MustExist must_exist;
+  TransactionLoadFlags flags;
   TransactionStatusCallback callback;
 };
 
@@ -202,7 +205,8 @@ struct TransactionMetadata {
   uint64_t priority;
 
   // Used for snapshot isolation (as read time and for conflict resolution).
-  HybridTime start_time;
+  // start_time is used only for backward compability during rolling update.
+  HybridTime DEPRECATED_start_time;
 
   static Result<TransactionMetadata> FromPB(const TransactionMetadataPB& source);
 
@@ -222,9 +226,11 @@ inline bool operator!=(const TransactionMetadata& lhs, const TransactionMetadata
 
 std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata);
 
-MonoTime TransactionRpcDeadline();
+MonoDelta TransactionRpcTimeout();
+CoarseTimePoint TransactionRpcDeadline();
 
 extern const std::string kTransactionsTableName;
+extern const std::string kMetricsSnapshotsTableName;
 
 } // namespace yb
 

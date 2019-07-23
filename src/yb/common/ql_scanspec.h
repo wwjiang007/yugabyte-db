@@ -66,6 +66,11 @@ class QLScanRange {
   // Return the inclusive lower and upper range values to scan.
   std::vector<QLValuePB> range_values(bool lower_bound) const;
 
+  QLRange RangeFor(ColumnId col_id) const {
+    const auto& iter = ranges_.find(col_id);
+    return (iter == ranges_.end() ? QLRange() : iter->second);
+  }
+
   bool has_in_range_options() const {
     return has_in_range_options_;
   }
@@ -124,11 +129,19 @@ class PgsqlScanSpec : public YQLScanSpec {
  public:
   typedef std::unique_ptr<common::PgsqlScanSpec> UniPtr;
 
-  explicit PgsqlScanSpec(QLClient client_type) : YQLScanSpec(client_type) {
+  explicit PgsqlScanSpec(QLClient client_type,
+                         const PgsqlExpressionPB *where_expr,
+                         QLExprExecutor::SharedPtr executor = nullptr);
+
+  virtual ~PgsqlScanSpec();
+
+  const PgsqlExpressionPB *where_expr() {
+    return where_expr_;
   }
 
-  virtual ~PgsqlScanSpec() {
-  }
+ protected:
+  const PgsqlExpressionPB *where_expr_;
+  QLExprExecutor::SharedPtr executor_;
 };
 
 } // namespace common

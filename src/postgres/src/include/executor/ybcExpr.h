@@ -7,7 +7,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
  *
- * http: *www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software distributed under the License
  * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
@@ -32,10 +32,11 @@
 
 #include "yb/yql/pggate/ybc_pggate.h"
 
+// Construct column reference expression.
+extern YBCPgExpr YBCNewColumnRef(YBCPgStatement ybc_stmt, int16_t attr_num, int attr_typid,
+																 const YBCPgTypeAttrs *type_attrs);
+
 // Construct constant expression using the given datatype "type_id" and value "datum".
 extern YBCPgExpr YBCNewConstant(YBCPgStatement ybc_stmt, Oid type_id, Datum datum, bool is_null);
-
-// Construct column reference expression.
-extern YBCPgExpr YBCNewColumnRef(YBCPgStatement ybc_stmt, int16_t attr_num);
 
 #endif							/* YBCEXPR_H */

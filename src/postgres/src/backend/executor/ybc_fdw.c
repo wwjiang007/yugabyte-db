@@ -8,7 +8,7 @@
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
  *
- * http: *www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software distributed under the License
  * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
@@ -25,6 +25,7 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <string.h>
 
 #include "executor/ybc_fdw.h"
 
@@ -32,6 +33,7 @@
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/sysattr.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_foreign_table.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
@@ -43,6 +45,7 @@
 #include "nodes/makefuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
@@ -54,13 +57,24 @@
 #include "commands/dbcommands.h"
 #include "catalog/pg_operator.h"
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "yb/yql/pggate/ybc_pggate.h"
 #include "pg_yb_utils.h"
+#include "access/ybcam.h"
 #include "executor/ybcExpr.h"
 
-/* ----------------------------------------------------------------------------- */
+#include "utils/resowner_private.h"
+
+/* -------------------------------------------------------------------------- */
 /*  Planner/Optimizer functions */
+
+typedef struct YbFdwPlanState
+{
+	/* Bitmap of attribute (column) numbers that we need to fetch from YB. */
+	Bitmapset *target_attrs;
+
+} YbFdwPlanState;
 
 /*
  * ybcGetForeignRelSize
@@ -71,49 +85,52 @@ ybcGetForeignRelSize(PlannerInfo *root,
 					 RelOptInfo *baserel,
 					 Oid foreigntableid)
 {
+	YbFdwPlanState		*ybc_plan = NULL;
+
+	ybc_plan = (YbFdwPlanState *) palloc0(sizeof(YbFdwPlanState));
+
 	/* Save the output-rows estimate for the planner */
-	baserel->rows = 1000;
-	/* TODO implement this. */
+	baserel->rows = YBC_DEFAULT_NUM_ROWS;
+	baserel->fdw_private = ybc_plan;
+
+	/*
+	 * Test any indexes of rel for applicability also.
+	 */
+	check_index_predicates(root, baserel);
 }
 
 /*
  * ybcGetForeignPaths
- *		Create possible access paths for a scan on the foreign table
- *
- *		Currently we don't support any push-down feature, so there is only one
- *		possible access path, which simply returns all records in the order in
- *		the data file.
+ *		Create possible access paths for a scan on the foreign table, which is
+ *      the full table scan plus available index paths (including the  primary key
+ *      scan path if any).
  */
 static void
 ybcGetForeignPaths(PlannerInfo *root,
 				   RelOptInfo *baserel,
 				   Oid foreigntableid)
 {
-	Cost		startup_cost;
-	Cost		total_cost;
-	Cost		cpu_per_tuple;
+	Cost startup_cost;
+	Cost total_cost;
 
 	/* Estimate costs */
-	startup_cost = baserel->baserestrictcost.startup;
-	cpu_per_tuple = cpu_tuple_cost * 10 + baserel->baserestrictcost.per_tuple;
-	total_cost = startup_cost + seq_page_cost * baserel->pages + cpu_per_tuple * baserel->rows;
+	ybcCostEstimate(baserel, YBC_FULL_SCAN_SELECTIVITY, &startup_cost, &total_cost);
 
-	/* Create a ForeignPath node and add it as only possible path. */
-	add_path(baserel, (Path *)
-			 create_foreignscan_path(root, baserel,
-									 NULL,	/* default pathtarget */
-									 baserel->rows,
-									 startup_cost,
-									 total_cost,
-									 NIL,	/* no pathkeys */
-									 NULL,	/* no outer rel either */
-									 NULL,	/* no extra plan */
-									 NULL /* no options yet */ ));
+	/* Create a ForeignPath node and it as the scan path */
+	add_path(baserel,
+	         (Path *) create_foreignscan_path(root,
+	                                          baserel,
+	                                          NULL, /* default pathtarget */
+	                                          baserel->rows,
+	                                          startup_cost,
+	                                          total_cost,
+	                                          NIL,  /* no pathkeys */
+	                                          NULL, /* no outer rel either */
+	                                          NULL, /* no extra plan */
+	                                          NULL  /* no options yet */ ));
 
-	/*
-	 * TODO there are some things we could send to the planner here, in
-	 * particular the primary key filtering and row ordering invariants.
-	 */
+	/* Add primary key and secondary index paths also */
+	create_index_paths(root, baserel);
 }
 
 /*
@@ -129,39 +146,98 @@ ybcGetForeignPlan(PlannerInfo *root,
 				  List *scan_clauses,
 				  Plan *outer_plan)
 {
-	Index		scan_relid = baserel->relid;
+	YbFdwPlanState *yb_plan_state = (YbFdwPlanState *) baserel->fdw_private;
+	Index          scan_relid     = baserel->relid;
+	ListCell       *lc;
 
-	/*
-	 * TODO We should tell postgres which restriction clauses we actually
-	 * support here. For now just put all the scan_clauses into the plan
-	 * node's qual list for the executor to check.  So all we have to do here
-	 * is strip RestrictInfo nodes from the clauses and ignore pseudoconstants
-	 * (which will be handled elsewhere).
-	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
+	/* Get the target columns that need to be retrieved from YugaByte */
+	foreach(lc, baserel->reltarget->exprs)
+	{
+		Expr *expr = (Expr *) lfirst(lc);
+		pull_varattnos_min_attr((Node *) expr,
+		                        baserel->relid,
+		                        &yb_plan_state->target_attrs,
+		                        baserel->min_attr);
+	}
+
+	foreach(lc, scan_clauses)
+	{
+		Expr *expr = (Expr *) lfirst(lc);
+		pull_varattnos_min_attr((Node *) expr,
+		                        baserel->relid,
+		                        &yb_plan_state->target_attrs,
+		                        baserel->min_attr);
+	}
+
+	/* Set scan targets. */
+	List *target_attrs = NULL;
+	bool wholerow = false;
+	for (AttrNumber attnum = baserel->min_attr; attnum <= baserel->max_attr; attnum++)
+	{
+		int bms_idx = attnum - baserel->min_attr + 1;
+		if (wholerow || bms_is_member(bms_idx, yb_plan_state->target_attrs))
+		{
+			switch (attnum)
+			{
+				case InvalidAttrNumber:
+					/*
+					 * Postgres repurposes InvalidAttrNumber to represent the "wholerow"
+					 * junk attribute.
+					 */
+					wholerow = true;
+					break;
+				case SelfItemPointerAttributeNumber:
+				case MinTransactionIdAttributeNumber:
+				case MinCommandIdAttributeNumber:
+				case MaxTransactionIdAttributeNumber:
+				case MaxCommandIdAttributeNumber:
+					ereport(ERROR,
+					        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg(
+							        "System column with id %d is not supported yet",
+							        attnum)));
+					break;
+				case TableOidAttributeNumber:
+					/* Nothing to do in YugaByte: Postgres will handle this. */
+					break;
+				case ObjectIdAttributeNumber:
+				case YBTupleIdAttributeNumber:
+				default: /* Regular column: attrNum > 0*/
+				{
+					TargetEntry *target = makeNode(TargetEntry);
+					target->resno = attnum;
+					target_attrs = lappend(target_attrs, target);
+				}
+			}
+		}
+	}
+
 	/* Create the ForeignScan node */
-	return make_foreignscan(tlist,
-							scan_clauses,
-							scan_relid,
-							NIL,	/* no expressions to evaluate */
-							best_path->fdw_private,
-							NIL,	/* no custom tlist */
-							NIL,	/* no remote quals */
-							outer_plan);
+	return make_foreignscan(tlist,  /* target list */
+	                        scan_clauses,
+	                        scan_relid,
+	                        NIL,    /* expressions YB may evaluate (none) */
+	                        target_attrs,  /* fdw_private data for YB */
+	                        NIL,    /* custom YB target list (none for now) */
+	                        NIL,    /* custom YB target list (none for now) */
+	                        outer_plan);
 }
 
-/* ----------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
 /*  Scanning functions */
 
 /*
  * FDW-specific information for ForeignScanState.fdw_state.
  */
-typedef struct YbcFdwExecutionState
+typedef struct YbFdwExecState
 {
 	/* The handle for the internal YB Select statement. */
-	YBCPgStatement handle;
-}			YbcFdwExecutionState;
+	YBCPgStatement	handle;
+	ResourceOwner	stmt_owner;
+	YBCPgExecParameters *exec_params; /* execution control parameters for YugaByte */
+	bool is_exec_done; /* Each statement should be executed exactly one time */
+} YbFdwExecState;
 
 /*
  * ybcBeginForeignScan
@@ -171,78 +247,103 @@ static void
 ybcBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	ForeignScan *foreignScan = (ForeignScan *) node->ss.ps.plan;
-	Relation	relation = node->ss.ss_currentRelation;
-	char	   *dbname = get_database_name(MyDatabaseId);
-	char	   *schemaname = get_namespace_name(relation->rd_rel->relnamespace);
-	char	   *tablename = NameStr(relation->rd_rel->relname);
-	YbcFdwExecutionState *ybc_state = NULL;
-	ListCell   *lc;
+	EState      *estate      = node->ss.ps.state;
+	Relation    relation     = node->ss.ss_currentRelation;
+	TupleDesc   tupdesc      = RelationGetDescr(relation);
+
+	/* Planning function above should ensure target list is set */
+	List *target_attrs = foreignScan->fdw_private;
+
+	YbFdwExecState *ybc_state = NULL;
+	ListCell       *lc;
 
 	/* Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL. */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
-	PG_TRY();
+	/* Allocate and initialize YB scan state. */
+	ybc_state = (YbFdwExecState *) palloc0(sizeof(YbFdwExecState));
+
+	node->fdw_state = (void *) ybc_state;
+	HandleYBStatus(YBCPgNewSelect(ybc_pg_session,
+	                              YBCGetDatabaseOid(relation),
+	                              RelationGetRelid(relation),
+	                              InvalidOid /* index_oid */,
+	                              &ybc_state->handle,
+	                              estate ? &estate->es_yb_read_ht : 0));
+	ResourceOwnerEnlargeYugaByteStmts(CurrentResourceOwner);
+	ResourceOwnerRememberYugaByteStmt(CurrentResourceOwner, ybc_state->handle);
+	ybc_state->stmt_owner = CurrentResourceOwner;
+	ybc_state->exec_params = &estate->yb_exec_params;
+	ybc_state->is_exec_done = false;
+
+	/* Set scan targets. */
+	bool has_targets = false;
+	foreach(lc, target_attrs)
 	{
-		/* Allocate and initialize YB scan state. */
-		ybc_state = (YbcFdwExecutionState *) palloc(sizeof(YbcFdwExecutionState));
-		node->fdw_state = (void *) ybc_state;
-		HandleYBStatus(YBCPgNewSelect(ybc_pg_session,
-																	dbname,
-																	schemaname,
-																	tablename,
-																	&ybc_state->handle));
+		TargetEntry *target = (TargetEntry *) lfirst(lc);
 
-		/* Set WHERE clause values (currently only partition key). */
-		RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PRIMARY_KEY);
-		foreach(lc, foreignScan->scan.plan.qual)
+		/* For regular (non-system) attribute check if they were deleted */
+		Oid   attr_typid  = InvalidOid;
+		int32 attr_typmod = 0;
+		if (target->resno > 0)
 		{
-			Expr	   *expr = (Expr *) lfirst(lc);
-
-			if (expr->type == T_OpExpr)
+			Form_pg_attribute attr;
+			attr = TupleDescAttr(tupdesc, target->resno - 1);
+			/* Ignore dropped attributes */
+			if (attr->attisdropped)
 			{
-				OpExpr	   *opExpr = (OpExpr *) expr;
-
-				// TODO(mihnea) WHERE clause should be analyzed for operators other than Int4EqualOperator.
-				if (opExpr->opno == Int4EqualOperator)
-				{
-					Var		   *col_desc = linitial(opExpr->args);
-					Const	   *col_val = lsecond(opExpr->args);
-
-					/* TODO distinguish partition key only. */
-					if (bms_is_member(col_desc->varattno - FirstLowInvalidHeapAttributeNumber,
-									  relation->rd_pkattr))
-					{
-						YBCPgExpr ybc_expr = YBCNewConstant(
-							ybc_state->handle, INT4OID, col_val->constvalue, false);
-						HandleYBStatus(YBCPgDmlBindColumn(ybc_state->handle, col_desc->varattno, ybc_expr));
-					}
-				}
+				continue;
 			}
+			attr_typid  = attr->atttypid;
+			attr_typmod = attr->atttypmod;
 		}
 
-		/* Set scan targets. */
-		/* TODO Fix the allocation here when the YB API for this is changed. */
-		foreach(lc, foreignScan->scan.plan.targetlist)
-		{
-			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			YBCPgExpr expr = YBCNewColumnRef(ybc_state->handle, tle->resno);
-			YBCPgDmlAppendTarget(ybc_state->handle, expr);
-		}
-
-		/* Execute the select statement. */
-		HandleYBStatus(YBCPgExecSelect(ybc_state->handle));
-
+		YBCPgTypeAttrs type_attrs = {attr_typmod};
+		YBCPgExpr      expr       = YBCNewColumnRef(ybc_state->handle,
+		                                            target->resno,
+		                                            attr_typid,
+		                                            &type_attrs);
+		HandleYBStmtStatusWithOwner(YBCPgDmlAppendTarget(ybc_state->handle,
+		                                                 expr),
+		                            ybc_state->handle,
+		                            ybc_state->stmt_owner);
+		has_targets = true;
 	}
-	PG_CATCH();
+
+	/*
+	 * We can have no target columns at this point for e.g. a count(*). For now
+	 * we request the first non-dropped column in that case.
+	 * TODO look into handling this on YugaByte side.
+	 */
+	if (!has_targets)
 	{
-		if (ybc_state != NULL) {
-			HandleYBStatus(YBCPgDeleteStatement(ybc_state->handle));
-			ybc_state->handle = NULL;
+		for (int16_t i = 0; i < tupdesc->natts; i++)
+		{
+			/* Ignore dropped attributes */
+			if (TupleDescAttr(tupdesc, i)->attisdropped)
+			{
+				continue;
+			}
+
+			YBCPgTypeAttrs type_attrs = { TupleDescAttr(tupdesc, i)->atttypmod };
+			YBCPgExpr      expr       = YBCNewColumnRef(ybc_state->handle,
+			                                            i + 1,
+														TupleDescAttr(tupdesc, i)->atttypid,
+			                                            &type_attrs);
+			HandleYBStmtStatusWithOwner(YBCPgDmlAppendTarget(ybc_state->handle,
+			                                                 expr),
+			                            ybc_state->handle,
+			                            ybc_state->stmt_owner);
+			break;
 		}
-		PG_RE_THROW();
 	}
-	PG_END_TRY();
+
+	/* Set the current syscatalog version (will check that we are up to date) */
+	HandleYBStmtStatusWithOwner(YBCPgSetCatalogCacheVersion(ybc_state->handle,
+	                                                        yb_catalog_cache_version),
+	                            ybc_state->handle,
+	                            ybc_state->stmt_owner);
 }
 
 /*
@@ -253,32 +354,73 @@ ybcBeginForeignScan(ForeignScanState *node, int eflags)
 static TupleTableSlot *
 ybcIterateForeignScan(ForeignScanState *node)
 {
-	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	YbcFdwExecutionState *ybc_state = (YbcFdwExecutionState *) node->fdw_state;
-	bool has_data = false;
+	TupleTableSlot *slot      = node->ss.ss_ScanTupleSlot;
+	YbFdwExecState *ybc_state = (YbFdwExecState *) node->fdw_state;
+	bool           has_data   = false;
+
+	/* Execute the select statement one time.
+	 * TODO(neil) Check whether YugaByte PgGate should combine Exec() and Fetch() into one function.
+	 * - The first fetch from YugaByte PgGate requires a number of operations including allocating
+	 *   operators and protobufs. These operations are done by YBCPgExecSelect() function.
+	 * - The subsequent fetches don't need to setup the query with these operations again.
+	 */
+	if (!ybc_state->is_exec_done) {
+		HandleYBStmtStatusWithOwner(YBCPgExecSelect(ybc_state->handle, ybc_state->exec_params),
+																ybc_state->handle,
+																ybc_state->stmt_owner);
+		ybc_state->is_exec_done = true;
+	}
 
 	/* Clear tuple slot before starting */
 	ExecClearTuple(slot);
-	PG_TRY();
-	{
-		// Fetch one row.
-		HandleYBStatus(YBCPgDmlFetch(ybc_state->handle, (uint64_t*) slot->tts_values,
-			slot->tts_isnull, &has_data));
 
-		/* If we have result(s) update the tuple slot. */
-		if (has_data)
-		{
-			ExecStoreVirtualTuple(slot);
-		}
-	}
-	PG_CATCH();
+	TupleDesc       tupdesc = slot->tts_tupleDescriptor;
+	Datum           *values = slot->tts_values;
+	bool            *isnull = slot->tts_isnull;
+	YBCPgSysColumns syscols;
+
+	/* Fetch one row. */
+	HandleYBStmtStatusWithOwner(YBCPgDmlFetch(ybc_state->handle,
+	                                          tupdesc->natts,
+	                                          (uint64_t *) values,
+	                                          isnull,
+	                                          &syscols,
+	                                          &has_data),
+	                            ybc_state->handle,
+	                            ybc_state->stmt_owner);
+
+	/* If we have result(s) update the tuple slot. */
+	if (has_data)
 	{
-		HandleYBStatus(YBCPgDeleteStatement(ybc_state->handle));
-		PG_RE_THROW();
+		HeapTuple tuple = heap_form_tuple(tupdesc, values, isnull);
+		if (syscols.oid != InvalidOid)
+		{
+			HeapTupleSetOid(tuple, syscols.oid);
+		}
+
+		slot = ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+
+		/* Setup special columns in the slot */
+		slot->tts_ybctid = PointerGetDatum(syscols.ybctid);
 	}
-	PG_END_TRY();
 
 	return slot;
+}
+
+static void
+ybcFreeStatementObject(YbFdwExecState* yb_fdw_exec_state)
+{
+	/* If yb_fdw_exec_state is NULL, we are in EXPLAIN; nothing to do */
+	if (yb_fdw_exec_state != NULL && yb_fdw_exec_state->handle != NULL)
+	{
+		HandleYBStatus(YBCPgDeleteStatement(yb_fdw_exec_state->handle));
+		ResourceOwnerForgetYugaByteStmt(yb_fdw_exec_state->stmt_owner,
+										yb_fdw_exec_state->handle);
+		yb_fdw_exec_state->handle = NULL;
+		yb_fdw_exec_state->stmt_owner = NULL;
+		yb_fdw_exec_state->exec_params = NULL;
+		yb_fdw_exec_state->is_exec_done = false;
+	}
 }
 
 /*
@@ -288,34 +430,13 @@ ybcIterateForeignScan(ForeignScanState *node)
 static void
 ybcReScanForeignScan(ForeignScanState *node)
 {
+	YbFdwExecState *ybc_state = (YbFdwExecState *) node->fdw_state;
 
-	YbcFdwExecutionState *ybc_state = (YbcFdwExecutionState *) node->fdw_state;
-
-	HandleYBStatus(YBCPgDeleteStatement(ybc_state->handle));
-	ybc_state->handle = NULL;
+	/* Clear (delete) the previous select */
+	ybcFreeStatementObject(ybc_state);
 
 	/* Re-allocate and execute the select. */
-	char	   *dbname = get_database_name(MyDatabaseId);
-	char	   *schemaname = get_namespace_name(node->ss.ss_currentRelation->rd_rel->relnamespace);
-	char	   *tablename = NameStr(node->ss.ss_currentRelation->rd_rel->relname);
-
-	PG_TRY();
-	{
-		HandleYBStatus(YBCPgNewSelect(ybc_pg_session,
-																	dbname,
-																	schemaname,
-																	tablename,
-																	&ybc_state->handle));
-
-		/* TODO Set (primary/partition key) values and execute. */
-		HandleYBStatus(YBCPgExecSelect(ybc_state->handle));
-	}
-	PG_CATCH();
-	{
-		HandleYBStatus(YBCPgDeleteStatement(ybc_state->handle));
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	ybcBeginForeignScan(node, 0 /* eflags */);
 }
 
 /*
@@ -325,16 +446,11 @@ ybcReScanForeignScan(ForeignScanState *node)
 static void
 ybcEndForeignScan(ForeignScanState *node)
 {
-	YbcFdwExecutionState *ybc_state = (YbcFdwExecutionState *) node->fdw_state;
-
-	/* If yb_state is NULL, we are in EXPLAIN; nothing to do */
-	if (ybc_state)
-	{
-		HandleYBStatus(YBCPgDeleteStatement(ybc_state->handle));
-	}
+	YbFdwExecState *ybc_state = (YbFdwExecState *) node->fdw_state;
+	ybcFreeStatementObject(ybc_state);
 }
 
-/* ----------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
 /*  FDW declaration */
 
 /*
@@ -346,16 +462,16 @@ ybc_fdw_handler()
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
-	fdwroutine->GetForeignRelSize = ybcGetForeignRelSize;
-	fdwroutine->GetForeignPaths = ybcGetForeignPaths;
-	fdwroutine->GetForeignPlan = ybcGetForeignPlan;
-	fdwroutine->BeginForeignScan = ybcBeginForeignScan;
+	fdwroutine->GetForeignRelSize  = ybcGetForeignRelSize;
+	fdwroutine->GetForeignPaths    = ybcGetForeignPaths;
+	fdwroutine->GetForeignPlan     = ybcGetForeignPlan;
+	fdwroutine->BeginForeignScan   = ybcBeginForeignScan;
 	fdwroutine->IterateForeignScan = ybcIterateForeignScan;
-	fdwroutine->ReScanForeignScan = ybcReScanForeignScan;
-	fdwroutine->EndForeignScan = ybcEndForeignScan;
+	fdwroutine->ReScanForeignScan  = ybcReScanForeignScan;
+	fdwroutine->EndForeignScan     = ybcEndForeignScan;
 
 	/* TODO: These are optional but we should support them eventually. */
-	/* fdwroutine->ExplainForeignScan = fileExplainForeignScan; */
+	/* fdwroutine->ExplainForeignScan = ybcExplainForeignScan; */
 	/* fdwroutine->AnalyzeForeignTable = ybcAnalyzeForeignTable; */
 	/* fdwroutine->IsForeignScanParallelSafe = ybcIsForeignScanParallelSafe; */
 

@@ -19,10 +19,17 @@ script_name=${script_name%.*}
 
 . "${BASH_SOURCE%/*}"/build-support/common-test-env.sh
 
+ensure_option_has_arg() {
+  if [[ $# -lt 2 ]]; then
+    echo "Command line option $1 expects an argument" >&2
+    exit 1
+  fi
+}
+
 show_help() {
   cat >&2 <<-EOT
 yb_build.sh (or "ybd") is the main build tool for YugaByte Database.
-Usage: ${0##*/} [<options>] [<build_type>] [<target_keywords>]
+Usage: ${0##*/} [<options>] [<build_type>] [<target_keywords>] [<yb_env_var_settings>]
 Options:
   -h, --help
     Show help.
@@ -98,8 +105,6 @@ Options:
     about the build root, compiler used, etc.
   --force, -f, -y
     Run a clean build without asking for confirmation even if a clean build was recently done.
-  --with-assembly
-    Build the java code with assembly (basically builds the yb-sample-apps.jar as well)
   -j <parallelism>, -j<parallelism>
     Build using the given number of concurrent jobs (defaults to the number of CPUs).
   --remote
@@ -122,7 +127,10 @@ Options:
     The build root directory, e.g. build/debug-gcc-dynamic-enterprise. This is used in scripting
     and is checked against other parameters.
   --python-tests
-    Run various Python tests (doctest, unit test)
+    Run various Python tests (doctest, unit test) and exit.
+  --java-lint
+    Run a simple shell-based "linter" on our Java code that verifies that we are importing the right
+    methods for assertions and using the right test runners. We exit the script after this step.
   --cotire
     Enable precompiled headers using cotire.
   --cmake-args
@@ -166,16 +174,31 @@ Options:
     Clean and rebuild PostgeSQL code
   --sanitizers-enable-coredump
     When running tests with LLVM sanitizers (ASAN/TSAN/etc.), enable core dump.
+  --extra-daemon-flags <extra_daemon_flags>
+    Extra flags to pass to mini-cluster daemons (master/tserver). Note that bash-style quoting won't
+    work here -- they are naively split on spaces.
+  --no-latest-symlink
+    Disable the creation/overwriting of the "latest" symlink in the build directory.
+  --static-analyzer
+    Enable Clang static analyzer
   --
     Pass all arguments after -- to repeat_unit_test.
+
 Build types:
   debug (default), fastdebug, release, profile_gen, profile_build, asan, tsan
+
 Supported target keywords:
   ...-test           - build and run a C++ test
   [yb-]master        - master executable
   [yb-]tserver       - tablet server executable
-  daemons            - both yb-master and yb-tserver
+  daemons            - yb-master, yb-tserver, and the postgres server
   packaged[-targets] - targets that are required for a release package
+  initdb             - Initialize the initial system catalog snapshot for fast cluster startup
+  reinitdb           - Reinitialize the initial system catalog snapshot for fast cluster startup
+
+Setting YB environment variables on the command line (for environment variables starting with YB_):
+  YB_SOME_VARIABLE1=some_value1 YB_SOME_VARIABLE2=some_value2
+The same also works for postgres_FLAGS_... variables.
 EOT
 }
 
@@ -250,8 +273,11 @@ print_report() {
       print_report_line "%s" "Build directory" "${BUILD_ROOT:-undefined}"
       print_report_line "%s" "Edition" "${YB_EDITION:-undefined}"
       print_report_line "%s" "Third-party dir" "${YB_THIRDPARTY_DIR:-undefined}"
-      if ! is_mac; then
+      if using_linuxbrew; then
         print_report_line "%s" "Linuxbrew dir" "${YB_LINUXBREW_DIR:-undefined}"
+      fi
+      if using_custom_homebrew; then
+        print_report_line "%s" "Custom Homebrew dir" "${YB_CUSTOM_HOMEBREW_DIR:-undefined}"
       fi
 
       set +u
@@ -270,6 +296,16 @@ print_report() {
       report_time "C++ (one test program)" "cxx_test"
       report_time "ctest (multiple C++ test programs)" "ctest"
       report_time "Remote tests" "remote_tests"
+
+      if [[ ${YB_SKIP_BUILD:-} == "1" ]]; then
+        echo
+        echo "NO COMPILATION WAS DONE AS PART OF THIS BUILD (--skip-build)"
+        echo
+      fi
+
+      if [[ -n ${YB_BUILD_EXIT_CODE:-} && $YB_BUILD_EXIT_CODE -ne 0 ]]; then
+        print_report_line "%s" "Exit code" "$YB_BUILD_EXIT_CODE"
+      fi
       horizontal_line
     ) >&2
   fi
@@ -290,8 +326,11 @@ build_root: "$BUILD_ROOT"
 compiler_type: "$YB_COMPILER_TYPE"
 thirdparty_dir: "${YB_THIRDPARTY_DIR:-$YB_SRC_ROOT/thirdparty}"
 EOT
-    if ! is_mac; then
+    if using_linuxbrew; then
       echo "linuxbrew_dir: \"${YB_LINUXBREW_DIR:-}\"" >>"$build_descriptor_path"
+    fi
+    if using_custom_homebrew; then
+      echo "custom_homebrew_dir: \"${YB_CUSTOM_HOMEBREW_DIR:-}\"" >>"$build_descriptor_path"
     fi
     log "Created a build descriptor file at '$build_descriptor_path'"
   fi
@@ -336,6 +375,9 @@ run_cxx_build() {
     done
     log_empty_line
   fi
+
+  fix_gtest_cxx_test_name
+  set_vars_for_cxx_test
 
   log "Running $make_program in $PWD"
   capture_sec_timestamp "make_start"
@@ -483,6 +525,28 @@ run_cxx_test() {
   fi
 }
 
+register_file_to_rebuild() {
+  expect_num_args 1 "$@"
+  local file_name=${1%.o}
+  object_files_to_delete+=(
+    "$file_name.o"
+    "$file_name.c.o"
+    "$file_name.cc.o"
+  )
+}
+
+# This is used for "initdb" and "reinitdb" target keywords.
+set_initdb_target() {
+  make_targets+=( "initial_sys_catalog_snapshot" )
+  build_java=false
+}
+
+cleanup() {
+  local YB_BUILD_EXIT_CODE=$?
+  print_report
+  exit "$YB_BUILD_EXIT_CODE"
+}
+
 # -------------------------------------------------------------------------------------------------
 # Command line parsing
 # -------------------------------------------------------------------------------------------------
@@ -513,7 +577,6 @@ export YB_GTEST_FILTER=""
 repeat_unit_test_inherited_args=()
 forward_args_to_repeat_unit_test=false
 original_args=( "$@" )
-java_with_assembly=false
 user_mvn_opts=""
 java_only=false
 cmake_only=false
@@ -528,11 +591,14 @@ running_any_tests=false
 clean_postgres=false
 export_compile_commands=false
 make_ninja_extra_args=""
+java_lint=false
 
 export YB_HOST_FOR_RUNNING_TESTS=${YB_HOST_FOR_RUNNING_TESTS:-}
 
 export YB_EXTRA_GTEST_FLAGS=""
 unset BUILD_ROOT
+
+export YB_RECREATE_INITIAL_SYS_CATALOG_SNAPSHOT=0
 
 while [[ $# -gt 0 ]]; do
   if is_valid_build_type "$1"; then
@@ -546,7 +612,7 @@ while [[ $# -gt 0 ]]; do
     continue
   fi
 
-  case "${1//_/-}" in
+  case ${1//_/-} in
     -h|--help)
       show_help >&2
       exit 1
@@ -590,9 +656,6 @@ while [[ $# -gt 0 ]]; do
     ;;
     --run-java-tests|--java-tests)
       run_java_tests=true
-    ;;
-    --with-assembly)
-      java_with_assembly=true
     ;;
     --static)
       YB_LINK=static
@@ -643,18 +706,26 @@ while [[ $# -gt 0 ]]; do
     --skip-test-existence-check|--no-test-existence-check|--ntec) test_existence_check=false ;;
     --skip-check-test-existence|--no-check-test-existence|--ncte) test_existence_check=false ;;
     --gtest-filter)
+      ensure_option_has_arg "$@"
       export YB_GTEST_FILTER=$2
       shift
     ;;
+    # Support the way of argument passing that is used for gtest test programs themselves.
+    --gtest-filter=*)
+      export YB_GTEST_FILTER=${2#--gtest-filter=}
+    ;;
     --rebuild-file)
-      object_files_to_delete+=( "$2.o" "$2.cc.o" )
+      ensure_option_has_arg "$@"
+      register_file_to_rebuild "$2"
       shift
     ;;
     --test-args)
+      ensure_option_has_arg "$@"
       export YB_EXTRA_GTEST_FLAGS+=" $2"
       shift
     ;;
     --rebuild-target)
+      ensure_option_has_arg "$@"
       object_files_to_delete+=( "$2.o" "$2.cc.o" )
       make_targets=( "$2" )
       shift
@@ -670,6 +741,7 @@ while [[ $# -gt 0 ]]; do
       java_only=true
     ;;
     --num-repetitions|--num-reps|-n)
+      ensure_option_has_arg "$@"
       num_test_repetitions=$2
       shift
       if [[ ! $num_test_repetitions =~ ^[0-9]+$ ]]; then
@@ -677,15 +749,18 @@ while [[ $# -gt 0 ]]; do
       fi
     ;;
     --write-build-descriptor)
+      ensure_option_has_arg "$@"
       build_descriptor_path=$2
       shift
     ;;
     --thirdparty-dir)
+      ensure_option_has_arg "$@"
       export YB_THIRDPARTY_DIR=$2
       shift
       validate_thirdparty_dir
     ;;
     -j)
+      ensure_option_has_arg "$@"
       export YB_MAKE_PARALLELISM=$2
       shift
     ;;
@@ -703,7 +778,8 @@ while [[ $# -gt 0 ]]; do
     ;;
     --)
       if [[ $num_test_repetitions -lt 2 ]]; then
-        fatal "Forward to arguments to repeat_unit_test.sh without multiple repetitions"
+        fatal "Trying to forward arguments to repeat_unit_test.sh, but -n not specified, so" \
+              "we won't be repeating a test multiple times."
       fi
       forward_args_to_repeat_unit_test=true
     ;;
@@ -717,8 +793,18 @@ while [[ $# -gt 0 ]]; do
     tserver|yb-tserver)
       make_targets+=( "yb-tserver" )
     ;;
+    initdb)
+      set_initdb_target
+    ;;
+    reinitdb)
+      export YB_RECREATE_INITIAL_SYS_CATALOG_SNAPSHOT=1
+      set_initdb_target
+    ;;
+    postgres)
+      make_targets+=( "postgres ")
+    ;;
     daemons|yb-daemons)
-      make_targets+=( "yb-master" "yb-tserver" )
+      make_targets+=( "yb-master" "yb-tserver" "postgres" )
     ;;
     packaged|packaged-targets)
       for packaged_target in $( "$YB_SRC_ROOT"/build-support/list_packaged_targets.py ); do
@@ -738,11 +824,13 @@ while [[ $# -gt 0 ]]; do
       export YB_EDITION=enterprise
     ;;
     --edition)
+      ensure_option_has_arg "$@"
       export YB_EDITION=$2
       validate_edition
       shift
     ;;
     --mvn-opts)
+      ensure_option_has_arg "$@"
       user_mvn_opts+=" $2"
       shift
     ;;
@@ -750,9 +838,10 @@ while [[ $# -gt 0 ]]; do
       export YB_USE_NINJA=1
     ;;
     --make)
-      unset YB_USE_NINJA
+      export YB_USE_NINJA=0
     ;;
     --build-root)
+      ensure_option_has_arg "$@"
       predefined_build_root=$2
       shift
     ;;
@@ -764,6 +853,7 @@ while [[ $# -gt 0 ]]; do
       force_run_cmake=true
     ;;
     --cmake-args)
+      ensure_option_has_arg "$@"
       if [[ -n $cmake_extra_args ]]; then
         cmake_extra_args+=" "
       fi
@@ -771,6 +861,7 @@ while [[ $# -gt 0 ]]; do
       shift
     ;;
     --make-ninja-extra-args)
+      ensure_option_has_arg "$@"
       if [[ -n $make_ninja_extra_args ]]; then
         make_ninja_extra_args+=" "
       fi
@@ -778,10 +869,12 @@ while [[ $# -gt 0 ]]; do
       shift
     ;;
     --host-for-tests)
+      ensure_option_has_arg "$@"
       export YB_HOST_FOR_RUNNING_TESTS=$2
       shift
     ;;
     --test-timeout-sec)
+      ensure_option_has_arg "$@"
       export YB_TEST_TIMEOUT=$2
       if [[ ! $YB_TEST_TIMEOUT =~ ^[0-9]+$ ]]; then
         fatal "Invalid value for test timeout: '$YB_TEST_TIMEOUT'"
@@ -789,10 +882,12 @@ while [[ $# -gt 0 ]]; do
       shift
     ;;
     --sanitizer-extra-options|--extra-sanitizer-options)
+      ensure_option_has_arg "$@"
       export YB_SANITIZER_EXTRA_OPTIONS=$2
       shift
     ;;
     --sanitizer-verbosity)
+      ensure_option_has_arg "$@"
       YB_SANITIZER_EXTRA_OPTIONS=${YB_SANITIZER_EXTRA_OPTIONS:-}
       export YB_SANITIZER_EXTRA_OPTIONS+=" verbosity=$2"
       shift
@@ -801,6 +896,7 @@ while [[ $# -gt 0 ]]; do
       show_report=false
     ;;
     --tp|--test-parallelism)
+      ensure_option_has_arg "$@"
       test_parallelism=$2
       validate_numeric_arg_range "test-parallelism" "$test_parallelism" \
         "$MIN_REPEATED_TEST_PARALLELISM" "$MAX_REPEATED_TEST_PARALLELISM"
@@ -816,6 +912,7 @@ while [[ $# -gt 0 ]]; do
       export YB_STACK_TRACE_ON_ERROR_STATUS=1
     ;;
     --stack-trace-error-status-re|--stesr)
+      ensure_option_has_arg "$@"
       export YB_STACK_TRACE_ON_ERROR_STATUS_RE=$2
       shift
     ;;
@@ -838,12 +935,46 @@ while [[ $# -gt 0 ]]; do
     --sanitizers-enable-coredump)
       export YB_SANITIZERS_ENABLE_COREDUMP=1
     ;;
+    --extra-daemon-flags)
+      ensure_option_has_arg "$@"
+      export YB_EXTRA_DAEMON_FLAGS=$2
+      shift
+    ;;
+    --java-lint)
+      java_lint=true
+    ;;
+    --no-latest-symlink)
+      export YB_DISABLE_LATEST_SYMLINK=1
+    ;;
+    --static-analyzer)
+      export YB_ENABLE_STATIC_ANALYZER=1
+    ;;
     *)
+      if [[ $1 =~ ^(YB_[A-Z0-9_]+|postgres_FLAGS_[a-zA-Z0-9_]+)=(.*)$ ]]; then
+        env_var_name=${BASH_REMATCH[1]}
+        # Use "the ultimate fix" from http://bit.ly/setenvvar to set a variable with the name stored
+        # in another variable to the given value.
+        env_var_value=${BASH_REMATCH[2]}
+        eval export $env_var_name=\$env_var_value  # note escaped dollar sign
+        log "Setting $env_var_name to: '$env_var_value' (as specified on the command line)"
+        unset env_var_name
+        unset env_var_value
+        shift
+        continue
+      fi
+
       echo "Invalid option: '$1'" >&2
       exit 1
   esac
   shift
 done
+
+update_submodules
+
+if [[ -n $YB_GTEST_FILTER && -z $cxx_test_name ]]; then
+  test_name=${YB_GTEST_FILTER%%.*}
+  set_cxx_test_name "GTEST_${test_name,,}"
+fi
 
 set_use_ninja
 handle_predefined_build_root
@@ -856,6 +987,7 @@ log "YB_COMPILER_TYPE=$YB_COMPILER_TYPE"
 if "$verbose"; then
   log "build_type=$build_type, cmake_build_type=$cmake_build_type"
 fi
+export BUILD_TYPE=$build_type
 
 if "$force_run_cmake" && "$force_no_run_cmake"; then
   fatal "--force-run-cmake and --force-no-run-cmake are incompatible"
@@ -888,7 +1020,7 @@ if "$java_only" && ! "$build_java"; then
         "--cxx-test or --skip-java-build."
 fi
 
-if [[ -n ${YB_THIRDPARTY_DIR:-} && $YB_THIRDPARTY_DIR != "$YB_SRC_ROOT/thirdparty" ]]; then
+if ! using_default_thirdparty_dir; then
   log "YB_THIRDPARTY_DIR ('$YB_THIRDPARTY_DIR') is not what we expect based on the source root " \
       "('$YB_SRC_ROOT/thirdparty'), not attempting to rebuild third-party dependencies."
   export NO_REBUILD_THIRDPARTY=1
@@ -934,8 +1066,8 @@ fi
 configure_remote_compilation
 do_not_use_local_thirdparty_flag_path=$YB_SRC_ROOT/thirdparty/.yb_thirdparty_do_not_use
 
-if [[ -f $do_not_use_local_thirdparty_flag_path ]] || \
-   "$use_shared_thirdparty" || \
+if [[ -f $do_not_use_local_thirdparty_flag_path ]] ||
+   "$use_shared_thirdparty" ||
    using_remote_compilation && ! "$no_shared_thirdparty"; then
   find_thirdparty_dir
 fi
@@ -943,6 +1075,12 @@ fi
 echo "Using third-party directory (YB_THIRDPARTY_DIR): $YB_THIRDPARTY_DIR"
 
 detect_edition
+
+if "$java_lint"; then
+  log "--lint-java-code specified, only linting java code and then exiting."
+  lint_java_code
+  exit
+fi
 
 # -------------------------------------------------------------------------------------------------
 # Recursively invoke this script in order to save the log to a file.
@@ -957,7 +1095,8 @@ if "$save_log"; then
   rm -f "$latest_log_symlink_path"
   ln -s "$log_path" "$latest_log_symlink_path"
 
-  echo "Logging to $log_path (also symlinked to $latest_log_symlink_path)" >&2
+  heading "Logging to $log_path (also symlinked to $latest_log_symlink_path)"
+
   filtered_args=()
   for arg in "${original_args[@]}"; do
     if [[ "$arg" != "--save-log" ]]; then
@@ -968,8 +1107,10 @@ if "$save_log"; then
   set +eu
   ( set -x; "$0" "${filtered_args[@]}" ) 2>&1 | tee "$log_path"
   exit_code=$?
-  echo "Log saved to $log_path (also symlinked to $latest_log_symlink_path)" >&2
-  print_report
+
+  heading "Log saved to $log_path (also symlinked to $latest_log_symlink_path)"
+
+  # No need to print a report here, because the recursive script invocation should have done so.
   exit "$exit_code"
 fi
 
@@ -982,7 +1123,6 @@ if "$verbose"; then
 fi
 
 set_build_root
-set_vars_for_cxx_test
 
 validate_cmake_build_type "$cmake_build_type"
 
@@ -1028,20 +1168,28 @@ fi
 if "$clean_before_build"; then
   log "Removing '$BUILD_ROOT' (--clean specified)"
   ( set -x; rm -rf "$BUILD_ROOT" )
-elif "$clean_postgres"; then
-  log "Removing contents of 'postgres_build' and 'postgres' subdirectories of '$BUILD_ROOT'"
-  ( set -x; rm -rf "$BUILD_ROOT/postgres_build"/* "$BUILD_ROOT/postgres"/* )
+else
+  if "$clean_postgres"; then
+    log "Removing contents of 'postgres_build' and 'postgres' subdirectories of '$BUILD_ROOT'"
+    ( set -x; rm -rf "$BUILD_ROOT/postgres_build"/* "$BUILD_ROOT/postgres"/* )
+  fi
 fi
 
 mkdir_safe "$BUILD_ROOT"
 mkdir_safe "thirdparty/installed/uninstrumented/include"
 mkdir_safe "thirdparty/installed-deps/include"
 
+# Install the cleanup handler that will print a report at the end, even if we terminate with an
+# error.
+trap cleanup EXIT
+
 cd "$BUILD_ROOT"
 
 activate_virtualenv
 check_python_interpreter_versions
 check_python_script_syntax
+
+set_java_home
 
 if "$clean_thirdparty"; then
   log "Removing and re-building third-party dependencies (--clean-thirdparty specified)"
@@ -1063,13 +1211,25 @@ detect_num_cpus_and_set_make_parallelism
 log "Using make parallelism of $YB_MAKE_PARALLELISM" \
     "(YB_REMOTE_COMPILATION=${YB_REMOTE_COMPILATION:-undefined})"
 
-set_build_env_vars
+add_brew_bin_to_path
 
 create_build_descriptor_file
 
 if [[ ${#make_targets[@]} -eq 0 && -n $java_test_name ]]; then
-  # Only build yb-master / yb-tserver when we're only trying to run a Java test.
-  make_targets+=( yb-master yb-tserver )
+  # Only build yb-master / yb-tserver / postgres when we're only trying to run a Java test.
+  make_targets+=( yb-master yb-tserver postgres )
+fi
+
+if [[ $build_type == "compilecmds" ]]; then
+  if [[ ${#make_targets[@]} -gt 0 ]]; then
+    fatal "Cannot specify custom Make targets for the 'compilecmds' build type, got: " \
+          "${make_targets[*]}"
+  fi
+  # We need to add anything that generates header files, and also the postgres build because it goes
+  # through the build_postgres.py script and that's also where we create the overall
+  # compile_commands.json file.
+  make_targets+=( gen_proto postgres yb_bfpg yb_bfql )
+  build_java=false
 fi
 
 if "$build_cxx" || "$force_run_cmake" || "$cmake_only"; then
@@ -1083,9 +1243,6 @@ if "$build_java"; then
   set_mvn_parameters
 
   java_build_opts=( install )
-  if ! "$java_with_assembly"; then
-    java_build_opts+=( -DskipAssembly )
-  fi
   java_build_opts+=( -DbinDir="$BUILD_ROOT/bin" )
 
   if ! "$run_java_tests" || should_run_java_test_methods_separately; then
@@ -1136,5 +1293,3 @@ if ! "$ran_tests_remotely"; then
     capture_sec_timestamp ctest_end
   fi
 fi
-
-print_report

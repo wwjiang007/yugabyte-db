@@ -16,6 +16,7 @@ package org.yb.cql;
 import java.nio.ByteBuffer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -23,7 +24,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
+import com.datastax.driver.core.SimpleStatement;
 import com.google.common.net.HostAndPort;
 import org.junit.After;
 import org.junit.BeforeClass;
@@ -31,6 +34,7 @@ import org.junit.Test;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import org.yb.client.YBClient;
+import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.Metrics;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.master.Master;
@@ -110,8 +114,10 @@ public class TestSystemTables extends BaseCQLTest {
 
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
-    BaseCQLTest.tserverArgs = Arrays.asList(String.format("--placement_region=%s",
-      PLACEMENT_REGION), String.format("--placement_zone=%s", PLACEMENT_ZONE));
+    BaseMiniClusterTest.tserverArgs.add(
+        String.format("--placement_region=%s", PLACEMENT_REGION));
+    BaseMiniClusterTest.tserverArgs.add(
+        String.format("--placement_zone=%s", PLACEMENT_ZONE));
   }
 
   @Test
@@ -509,4 +515,30 @@ public class TestSystemTables extends BaseCQLTest {
     // Verify the last end_key is empty.
     assertFalse(endKey.hasRemaining());
   }
+
+  private List<String> getRowsAsStringList(ResultSet rs) {
+    return rs.all().stream().map(Row::toString).collect(Collectors.toList());
+  }
+
+  @Test
+  public void testLimitOffsetPageSize() throws Exception {
+    SimpleStatement select_all = new SimpleStatement("select * from system_schema.columns");
+    ResultSet rs = session.execute(select_all);
+    List<String> all_rows = getRowsAsStringList(rs);
+
+    rs = session.execute("select * from system_schema.columns limit 15");
+    assertEquals(all_rows.subList(0, 15), getRowsAsStringList(rs));
+
+    rs = session.execute("select * from system_schema.columns offset 15 limit 30");
+    assertEquals(all_rows.subList(15, 45), getRowsAsStringList(rs));
+
+    rs = session.execute("select * from system_schema.columns offset 45");
+    assertEquals(all_rows.subList(45, all_rows.size()), getRowsAsStringList(rs));
+
+    // Paging is not supported for system tables so page size should be ignored (return all rows).
+    select_all.setFetchSize(10);
+    rs = session.execute(select_all);
+    assertEquals(all_rows, getRowsAsStringList(rs));
+  }
+
 }

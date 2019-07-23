@@ -39,6 +39,7 @@
 #include "yb/rocksdb/thread_status.h"
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/types.h"
+#include "yb/util/result.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -102,6 +103,8 @@ struct Range {
   Range(const Slice& s, const Slice& l) : start(s), limit(l) { }
 };
 
+YB_DEFINE_ENUM(FlushAbility, (kNoNewData)(kHasNewData)(kAlreadyFlushing))
+
 // A collections of table properties objects, where
 //  key: is the table's file name.
 //  value: the table properties object of the given table.
@@ -121,6 +124,8 @@ class DB {
   static Status Open(const Options& options,
                      const std::string& name,
                      DB** dbptr);
+
+  static yb::Result<std::unique_ptr<DB>> Open(const Options& options, const std::string& name);
 
   // Open the database for read only. All DB interfaces
   // that modify data, like put/delete, will return error.
@@ -687,6 +692,8 @@ class DB {
   // Get Env object from the DB
   virtual Env* GetEnv() const = 0;
 
+  virtual Env* GetCheckpointEnv() const = 0;
+
   // Get DB Options that we use.  During the process of opening the
   // column family, the options provided when calling DB::Open() or
   // DB::CreateColumnFamily() will have been "sanitized" and transformed
@@ -786,6 +793,9 @@ class DB {
   virtual uint64_t GetTotalSSTFileSize() { return 0; }
   virtual uint64_t GetUncompressedSSTFileSize() { return 0; }
 
+  // Returns the combined size of all the SST Files data blocks in the rocksdb instance.
+  virtual uint64_t GetDataSSTFileSize() { return 0; }
+
   // Returns a list of all table files with their level, start key
   // and end key
   virtual void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* /*metadata*/) {}
@@ -798,11 +808,15 @@ class DB {
 
   virtual UserFrontierPtr GetFlushedFrontier() { return nullptr; }
 
-  virtual CHECKED_STATUS SetFlushedFrontier(UserFrontierPtr values) {
+  virtual CHECKED_STATUS ModifyFlushedFrontier(
+      UserFrontierPtr values,
+      FrontierModificationMode mode) {
     return Status::OK();
   }
 
-  virtual bool HasSomethingToFlush() { return true; }
+  virtual FlushAbility GetFlushAbility() { return FlushAbility::kHasNewData; }
+
+  virtual UserFrontierPtr GetMutableMemTableSmallestFrontier() { return nullptr; }
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -873,6 +887,8 @@ class DB {
   virtual CHECKED_STATUS Import(const std::string& source_dir) {
     return STATUS(NotSupported, "");
   }
+
+  virtual bool NeedsDelay() { return false; }
 
   // Used in testing to make the old memtable immutable and start writing to a new one.
   virtual void TEST_SwitchMemtable() {}

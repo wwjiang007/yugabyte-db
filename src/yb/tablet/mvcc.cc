@@ -187,7 +187,7 @@ void MvccManager::AddPending(HybridTime* ht) {
 #endif
 
     if (*ht <= sanity_check_lower_bound) {
-      LOG(FATAL) << get_details_msg(/* drain_aborted */ true);
+      LOG_WITH_PREFIX(FATAL) << get_details_msg(/* drain_aborted */ true);
     }
   }
   queue_.push_back(*ht);
@@ -211,9 +211,10 @@ void MvccManager::SetPropagatedSafeTimeOnFollower(HybridTime ht) {
     if (ht >= propagated_safe_time_) {
       propagated_safe_time_ = ht;
     } else {
-      LOG(WARNING) << "Received propagated safe time " << ht << " less than the old value: "
-                   << propagated_safe_time_ << ". This could happen on followers when a new leader "
-                   << "is elected.";
+      LOG_WITH_PREFIX(WARNING)
+          << "Received propagated safe time " << ht << " less than the old value: "
+          << propagated_safe_time_ << ". This could happen on followers when a new leader "
+          << "is elected.";
     }
   }
   cond_.notify_all();
@@ -224,8 +225,8 @@ void MvccManager::UpdatePropagatedSafeTimeOnLeader(HybridTime ht_lease) {
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
-    auto ht = DoGetSafeTime(HybridTime::kMin,  // min_allowed
-                            MonoTime::kMax,    // deadline
+    auto ht = DoGetSafeTime(HybridTime::kMin,       // min_allowed
+                            CoarseTimePoint::max(), // deadline
                             ht_lease,
                             &lock);
 #ifndef NDEBUG
@@ -248,7 +249,7 @@ void MvccManager::UpdatePropagatedSafeTimeOnLeader(HybridTime ht_lease) {
 }
 
 HybridTime MvccManager::SafeTimeForFollower(
-    HybridTime min_allowed, MonoTime deadline) const {
+    HybridTime min_allowed, CoarseTimePoint deadline) const {
   std::unique_lock<std::mutex> lock(mutex_);
   SafeTimeWithSource result;
   auto predicate = [this, &result, min_allowed] {
@@ -263,9 +264,9 @@ HybridTime MvccManager::SafeTimeForFollower(
     }
     return result.safe_time >= min_allowed;
   };
-  if (deadline == MonoTime::kMax) {
+  if (deadline == CoarseTimePoint::max()) {
     cond_.wait(lock, predicate);
-  } else if (!cond_.wait_until(lock, deadline.ToSteadyTimePoint(), predicate)) {
+  } else if (!cond_.wait_until(lock, deadline, predicate)) {
     return HybridTime::kInvalid;
   }
   VLOG_WITH_PREFIX(1) << "SafeTimeForFollower(" << min_allowed
@@ -279,14 +280,14 @@ HybridTime MvccManager::SafeTimeForFollower(
 }
 
 HybridTime MvccManager::SafeTime(HybridTime min_allowed,
-                                 MonoTime deadline,
+                                 CoarseTimePoint deadline,
                                  HybridTime ht_lease) const {
   std::unique_lock<std::mutex> lock(mutex_);
   return DoGetSafeTime(min_allowed, deadline, ht_lease, &lock);
 }
 
 HybridTime MvccManager::DoGetSafeTime(const HybridTime min_allowed,
-                                      const MonoTime deadline,
+                                      const CoarseTimePoint deadline,
                                       const HybridTime ht_lease,
                                       std::unique_lock<std::mutex>* lock) const {
   DCHECK_ONLY_NOTNULL(lock);
@@ -326,9 +327,9 @@ HybridTime MvccManager::DoGetSafeTime(const HybridTime min_allowed,
 
   // In the case of an empty queue, the safe hybrid time to read at is only limited by hybrid time
   // ht_lease, which is by definition higher than min_allowed, so we would not get blocked.
-  if (deadline == MonoTime::kMax) {
+  if (deadline == CoarseTimePoint::max()) {
     cond_.wait(*lock, predicate);
-  } else if (!cond_.wait_until(*lock, deadline.ToSteadyTimePoint(), predicate)) {
+  } else if (!cond_.wait_until(*lock, deadline, predicate)) {
     return HybridTime::kInvalid;
   }
   VLOG_WITH_PREFIX(1) << "DoGetSafeTime(" << min_allowed << ", "
@@ -343,7 +344,7 @@ HybridTime MvccManager::DoGetSafeTime(const HybridTime min_allowed,
       << ", " << EXPR_VALUE_FOR_LOG(max_ht_lease_seen_)
       << ", " << EXPR_VALUE_FOR_LOG(last_replicated_)
       << ", " << EXPR_VALUE_FOR_LOG(clock_->Now())
-      << ", " << EXPR_VALUE_FOR_LOG(deadline.ToString())
+      << ", " << EXPR_VALUE_FOR_LOG(ToString(deadline))
       << ", " << EXPR_VALUE_FOR_LOG(queue_.size())
       << ", " << EXPR_VALUE_FOR_LOG(queue_);
 

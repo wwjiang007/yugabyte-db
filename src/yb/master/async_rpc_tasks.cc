@@ -26,8 +26,9 @@
 #include "yb/tserver/tserver_admin.proxy.h"
 
 #include "yb/util/flag_tags.h"
-#include "yb/util/logging.h"
 #include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/thread_restrictions.h"
 
 DEFINE_int32(unresponsive_ts_rpc_timeout_ms, 60 * 60 * 1000,  // 1 hour
              "After this amount of time (or after we have retried unresponsive_ts_rpc_retry_limit "
@@ -40,6 +41,10 @@ DEFINE_int32(unresponsive_ts_rpc_retry_limit, 20,
              "happens first), the master will stop attempting to contact a tablet server in order "
              "to perform operations such as deleting a tablet.");
 TAG_FLAG(unresponsive_ts_rpc_retry_limit, advanced);
+
+DEFINE_test_flag(
+    int32, slowdown_master_async_rpc_tasks_by_ms, 0,
+    "For testing purposes, slow down the run method to take longer.");
 
 // The flags are defined in catalog_manager.cc.
 DECLARE_int32(master_ts_rpc_timeout_ms);
@@ -104,10 +109,6 @@ Status PickLeaderReplica::PickReplica(TSDescriptor** ts_desc) {
 //  Class RetryingTSRpcTask.
 // ============================================================================
 
-namespace {
-constexpr int64_t kUnscheduledTaskId = -1;
-} // anonymous namespace
-
 RetryingTSRpcTask::RetryingTSRpcTask(Master *master,
                                      ThreadPool* callback_pool,
                                      gscoped_ptr<TSPicker> replica_picker,
@@ -118,7 +119,6 @@ RetryingTSRpcTask::RetryingTSRpcTask(Master *master,
     table_(table),
     start_ts_(MonoTime::Now()),
     attempt_(0),
-    reactor_task_id_(kUnscheduledTaskId),
     state_(MonitoredTaskState::kWaiting) {
   deadline_ = start_ts_;
   deadline_.AddDelta(MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms));
@@ -127,7 +127,12 @@ RetryingTSRpcTask::RetryingTSRpcTask(Master *master,
 // Send the subclass RPC request.
 Status RetryingTSRpcTask::Run() {
   VLOG_WITH_PREFIX(1) << "Start Running";
-  DCHECK(state() == MonitoredTaskState::kWaiting || state() == MonitoredTaskState::kAborted);
+  auto task_state = state();
+  if (task_state == MonitoredTaskState::kAborted) {
+    UnregisterAsyncTask();  // May delete this.
+    return STATUS(IllegalState, "Unable to run task because it has been aborted");
+  }
+  DCHECK(task_state == MonitoredTaskState::kWaiting) << "State: " << ToString(task_state);
 
   const Status s = ResetTSProxy();
   if (!s.ok()) {
@@ -137,7 +142,6 @@ Status RetryingTSRpcTask::Run() {
     } else if (state() == MonitoredTaskState::kAborted) {
       UnregisterAsyncTask();  // May delete this.
       return STATUS(IllegalState, "Unable to run task because it has been aborted");
-
     } else {
       LOG_WITH_PREFIX(FATAL) << "Failed to change task to MonitoredTaskState::kFailed state";
     }
@@ -161,6 +165,14 @@ Status RetryingTSRpcTask::Run() {
       return STATUS_FORMAT(IllegalState, "Task in invalid state $0", state());
     }
   }
+  if (PREDICT_FALSE(FLAGS_slowdown_master_async_rpc_tasks_by_ms > 0)) {
+    VLOG(1) << "Slowing down " << this->description() << " by "
+            << FLAGS_slowdown_master_async_rpc_tasks_by_ms << " ms.";
+    bool old_thread_restriction = ThreadRestrictions::SetWaitAllowed(true);
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_slowdown_master_async_rpc_tasks_by_ms));
+    ThreadRestrictions::SetWaitAllowed(old_thread_restriction);
+    VLOG(2) << "Slowing down " << this->description() << " done. Resuming.";
+  }
   if (!SendRequest(++attempt_)) {
     if (!RescheduleWithBackoffDelay()) {
       UnregisterAsyncTask();  // May call 'delete this'.
@@ -177,10 +189,12 @@ MonitoredTaskState RetryingTSRpcTask::AbortAndReturnPrevState() {
     auto expected = prev_state;
     if (state_.compare_exchange_weak(expected, MonitoredTaskState::kAborted)) {
       AbortIfScheduled();
+      UnregisterAsyncTask();
       return prev_state;
     }
     prev_state = state();
   }
+  UnregisterAsyncTask();
   return prev_state;
 }
 
@@ -262,9 +276,16 @@ bool RetryingTSRpcTask::RescheduleWithBackoffDelay() {
       LOG_WITH_PREFIX(WARNING) << "Unable to mark this task as MonitoredTaskState::kScheduling";
       return false;
     }
-    reactor_task_id_ = master_->messenger()->ScheduleOnReactor(
+    auto task_id = master_->messenger()->ScheduleOnReactor(
         std::bind(&RetryingTSRpcTask::RunDelayedTask, shared_from(this), _1),
-        MonoDelta::FromMilliseconds(delay_millis), master_->messenger());
+        MonoDelta::FromMilliseconds(delay_millis), SOURCE_LOCATION(), master_->messenger());
+    reactor_task_id_.store(task_id, std::memory_order_release);
+
+    if (task_id == rpc::kInvalidTaskId) {
+      AbortTask();
+      UnregisterAsyncTask();
+      return false;
+    }
 
     if (!PerformStateTransition(MonitoredTaskState::kScheduling, MonitoredTaskState::kWaiting)) {
       // The only valid reason for state not being MonitoredTaskState is because the task got
@@ -302,7 +323,11 @@ void RetryingTSRpcTask::RunDelayedTask(const Status& status) {
   }
 }
 
+void RetryingTSRpcTask::UnregisterAsyncTaskCallback() {}
+
 void RetryingTSRpcTask::UnregisterAsyncTask() {
+  UnregisterAsyncTaskCallback();
+
   auto s = state();
   if (!IsStateTerminal(s)) {
     LOG_WITH_PREFIX(FATAL) << "Invalid task state " << s;
@@ -315,7 +340,7 @@ void RetryingTSRpcTask::UnregisterAsyncTask() {
 
 void RetryingTSRpcTask::AbortIfScheduled() {
   auto reactor_task_id = reactor_task_id_.load(std::memory_order_acquire);
-  if (reactor_task_id != kUnscheduledTaskId) {
+  if (reactor_task_id != rpc::kInvalidTaskId) {
     master_->messenger()->AbortOnReactor(reactor_task_id);
   }
 }
@@ -454,11 +479,7 @@ void AsyncDeleteReplica::HandleResponse(int attempt) {
     VLOG(1) << "TS " << permanent_uuid_ << ": delete complete on tablet " << tablet_id_;
   }
   if (delete_done) {
-    master_->catalog_manager()->NotifyTabletDeleteFinished(permanent_uuid_, tablet_id_);
-    shared_ptr<TSDescriptor> ts_desc;
-    if (master_->ts_manager()->LookupTSByUUID(permanent_uuid_, &ts_desc)) {
-      ts_desc->ClearPendingTabletDelete(tablet_id_);
-    }
+    UnregisterAsyncTaskCallback();
   }
 }
 
@@ -477,6 +498,10 @@ bool AsyncDeleteReplica::SendRequest(int attempt) {
           << " (attempt " << attempt << "):\n"
           << req.DebugString();
   return true;
+}
+
+void AsyncDeleteReplica::UnregisterAsyncTaskCallback() {
+  master_->catalog_manager()->NotifyTabletDeleteFinished(permanent_uuid_, tablet_id_);
 }
 
 // ============================================================================
@@ -541,7 +566,7 @@ void AsyncAlterTable::HandleResponse(int attempt) {
 bool AsyncAlterTable::SendRequest(int attempt) {
   auto l = table_->LockForRead();
 
-  tserver::AlterSchemaRequestPB req;
+  tserver::ChangeMetadataRequestPB req;
   req.set_dest_uuid(permanent_uuid());
   req.set_tablet_id(tablet_->tablet_id());
   req.set_new_table_name(l->data().pb.name());
@@ -793,8 +818,7 @@ bool AsyncAddServerTask::PrepareRequest(int attempt) {
   RaftPeerPB* peer = req_.mutable_server();
   peer->set_permanent_uuid(replacement_replica->permanent_uuid());
   peer->set_member_type(member_type_);
-  TSRegistrationPB peer_reg;
-  replacement_replica->GetRegistration(&peer_reg);
+  TSRegistrationPB peer_reg = replacement_replica->GetRegistration();
 
   if (peer_reg.common().private_rpc_addresses().empty()) {
     YB_LOG_EVERY_N(WARNING, 100) << LogPrefix() << "Candidate replacement "

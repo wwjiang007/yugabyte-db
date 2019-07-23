@@ -226,14 +226,25 @@ Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
                                      const MonoDelta& timeout,
                                      CommittedEntryType type = CommittedEntryType::ANY);
 
-// Wait until the last committed OpId has index greater than 'opid_index' and store new value there.
-// The value pointed by 'opid_index' should not change during execution.
+// Wait until the last committed OpId index is greater than 'opid_index' and store the new index in
+// the same variable.
+// The value pointed by 'opid_index' should not change during the execution of this function.
 // 'type' - type of committed entry for check.
-Status WaitUntilCommittedOpIdIndexGrow(int64_t* opid_index,
-                                       TServerDetails* replica,
-                                       const TabletId& tablet_id,
-                                       const MonoDelta& timeout,
-                                       CommittedEntryType type = CommittedEntryType::ANY);
+Status WaitUntilCommittedOpIdIndexIsGreaterThan(int64_t* opid_index,
+                                                TServerDetails* replica,
+                                                const TabletId& tablet_id,
+                                                const MonoDelta& timeout,
+                                                CommittedEntryType type = CommittedEntryType::ANY);
+
+// Wait until the last committed OpId index is at least equal to 'opid_index' and store the index
+// in the same variable.
+// The value pointed by 'opid_index' should not change during the execution of this function.
+// 'type' - type of committed entry for check.
+Status WaitUntilCommittedOpIdIndexIsAtLeast(int64_t* opid_index,
+                                            TServerDetails* replica,
+                                            const TabletId& tablet_id,
+                                            const MonoDelta& timeout,
+                                            CommittedEntryType type = CommittedEntryType::ANY);
 
 // Returns:
 // Status::OK() if the replica is alive and leader of the consensus configuration.
@@ -368,7 +379,7 @@ Status WaitForNumTabletsOnTS(
 // Wait until the specified replica is in the specified state.
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const TabletId& tablet_id,
-                              tablet::TabletStatePB state,
+                              tablet::RaftGroupStatePB state,
                               const MonoDelta& timeout);
 
 // Wait until the specified tablet is in RUNNING state.

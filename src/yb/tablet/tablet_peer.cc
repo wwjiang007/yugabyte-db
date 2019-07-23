@@ -48,6 +48,7 @@
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
 #include "yb/consensus/raft_consensus.h"
+#include "yb/consensus/retryable_requests.h"
 
 #include "yb/docdb/consensus_frontier.h"
 #include "yb/docdb/docdb.h"
@@ -60,6 +61,7 @@
 #include "yb/rocksdb/db/memtable.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/thread_pool.h"
 
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet.pb.h"
@@ -68,20 +70,26 @@
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_peer_mm_ops.h"
 
-#include "yb/tablet/operations/alter_schema_operation.h"
+#include "yb/tablet/operations/change_metadata_operation.h"
 #include "yb/tablet/operations/operation_driver.h"
 #include "yb/tablet/operations/truncate_operation.h"
 #include "yb/tablet/operations/write_operation.h"
 #include "yb/tablet/operations/update_txn_operation.h"
 
+#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/trace.h"
 
+using namespace std::literals;
+using namespace std::placeholders;
 using std::shared_ptr;
 using std::string;
+
+DEFINE_test_flag(int32, delay_init_tablet_peer_ms, 0,
+                 "Wait before executing init tablet peer for specified amount of milliseconds.");
 
 namespace yb {
 namespace tablet {
@@ -131,51 +139,60 @@ using tserver::TabletServerErrorPB;
 //  Tablet Peer
 // ============================================================================
 TabletPeer::TabletPeer(
-    const scoped_refptr<TabletMetadata>& meta,
+    const RaftGroupMetadataPtr& meta,
     const consensus::RaftPeerPB& local_peer_pb,
+    const scoped_refptr<server::Clock> &clock,
+    const std::string& permanent_uuid,
     Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk)
   : meta_(meta),
-    tablet_id_(meta->tablet_id()),
+    tablet_id_(meta->raft_group_id()),
     local_peer_pb_(local_peer_pb),
-    state_(TabletStatePB::NOT_STARTED),
+    state_(RaftGroupStatePB::NOT_STARTED),
     status_listener_(new TabletStatusListener(meta)),
+    clock_(clock),
     log_anchor_registry_(new LogAnchorRegistry()),
-    mark_dirty_clbk_(std::move(mark_dirty_clbk)) {}
+    mark_dirty_clbk_(std::move(mark_dirty_clbk)),
+    permanent_uuid_(permanent_uuid) {}
 
 TabletPeer::~TabletPeer() {
   std::lock_guard<simple_spinlock> lock(lock_);
   // We should either have called Shutdown(), or we should have never called
   // Init().
-  CHECK(!tablet_)
-      << "TabletPeer not fully shut down. State: "
-      << TabletStatePB_Name(state_);
+  LOG_IF_WITH_PREFIX(DFATAL, tablet_) << "TabletPeer not fully shut down.";
 }
 
 Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
-                                  const std::shared_future<client::YBClientPtr> &client_future,
-                                  const scoped_refptr<server::Clock> &clock,
-                                  const shared_ptr<Messenger> &messenger,
+                                  const std::shared_future<client::YBClient*> &client_future,
+                                  const std::shared_ptr<MemTracker>& server_mem_tracker,
+                                  Messenger* messenger,
                                   rpc::ProxyCache* proxy_cache,
                                   const scoped_refptr<Log> &log,
                                   const scoped_refptr<MetricEntity> &metric_entity,
                                   ThreadPool* raft_pool,
                                   ThreadPool* tablet_prepare_pool,
-                                  rpc::ThreadPool* service_thread_pool) {
+                                  consensus::RetryableRequests* retryable_requests) {
 
   DCHECK(tablet) << "A TabletPeer must be provided with a Tablet";
   DCHECK(log) << "A TabletPeer must be provided with a Log";
 
+  if (FLAGS_delay_init_tablet_peer_ms > 0) {
+    std::this_thread::sleep_for(FLAGS_delay_init_tablet_peer_ms * 1ms);
+  }
+
   {
     std::lock_guard<simple_spinlock> lock(lock_);
-    CHECK_EQ(TabletStatePB::BOOTSTRAPPING, state_);
+    auto state = state_.load(std::memory_order_acquire);
+    if (state != RaftGroupStatePB::BOOTSTRAPPING) {
+      return STATUS_FORMAT(
+          IllegalState, "Invalid tablet state for init: $0", RaftGroupStatePB_Name(state));
+    }
     tablet_ = tablet;
     client_future_ = client_future;
-    clock_ = clock;
     proxy_cache_ = proxy_cache;
     log_ = log;
     // "Publish" the log pointer so it can be retrieved using the log() accessor.
     log_atomic_ = log.get();
-    service_thread_pool_ = service_thread_pool;
+    service_thread_pool_ = &messenger->ThreadPool();
 
     tablet->SetMemTableFlushFilterFactory([log] {
       auto index = log->GetLatestEntryOpId().index;
@@ -187,6 +204,12 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
           // to the log (maybe not synced, if durable_wal_write is disabled, but that's OK).
           return largest.op_id().index <= index;
         }
+
+        // It is correct to don't have frontiers when memtable is empty.
+        if (memtable.IsEmpty()) {
+          return true;
+        }
+
         // This is a degenerate case that should ideally never occur. An empty memtable got into the
         // list of immutable memtables. We say it is OK to flush it and move on.
         static const char* error_msg =
@@ -198,13 +221,17 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
     });
 
     ConsensusOptions options;
-    options.tablet_id = meta_->tablet_id();
+    options.tablet_id = meta_->raft_group_id();
 
     TRACE("Creating consensus instance");
 
     std::unique_ptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK(ConsensusMetadata::Load(meta_->fs_manager(), tablet_id_,
                                           meta_->fs_manager()->uuid(), &cmeta));
+
+    if (retryable_requests) {
+      retryable_requests->SetMetricEntity(tablet->GetMetricEntity());
+    }
 
     consensus_ = RaftConsensus::Create(
         options,
@@ -216,13 +243,14 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
         messenger,
         proxy_cache_,
         log_.get(),
+        server_mem_tracker,
         tablet_->mem_tracker(),
         mark_dirty_clbk_,
         tablet_->table_type(),
-        std::bind(&Tablet::LostLeadership, tablet.get()),
-        raft_pool);
+        raft_pool,
+        retryable_requests);
     has_consensus_.store(true, std::memory_order_release);
-    auto ht_lease_provider = [this](MicrosTime min_allowed, MonoTime deadline) {
+    auto ht_lease_provider = [this](MicrosTime min_allowed, CoarseTimePoint deadline) {
       MicrosTime lease_micros {
           consensus_->MajorityReplicatedHtLeaseExpiration(min_allowed, deadline) };
       if (!lease_micros) {
@@ -239,21 +267,21 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
     auto* mvcc_manager = tablet_->mvcc_manager();
     consensus_->SetPropagatedSafeTimeProvider([mvcc_manager, ht_lease_provider] {
       // Get the current majority-replicated HT leader lease without any waiting.
-      auto ht_lease = ht_lease_provider(/* min_allowed */ 0, /* deadline */ MonoTime::kMax);
+      auto ht_lease = ht_lease_provider(/* min_allowed */ 0, /* deadline */ CoarseTimePoint::max());
       if (!ht_lease) {
         return HybridTime::kInvalid;
       }
       return mvcc_manager->SafeTime(ht_lease);
     });
 
+    prepare_thread_ = std::make_unique<Preparer>(consensus_.get(), tablet_prepare_pool);
+
     consensus_->SetMajorityReplicatedListener([mvcc_manager, ht_lease_provider] {
-      auto ht_lease = ht_lease_provider(/* min_allowed */ 0, /* deadline */ MonoTime::kMax);
+      auto ht_lease = ht_lease_provider(/* min_allowed */ 0, /* deadline */ CoarseTimePoint::max());
       if (ht_lease) {
         mvcc_manager->UpdatePropagatedSafeTimeOnLeader(ht_lease);
       }
     });
-
-    prepare_thread_ = std::make_unique<Preparer>(consensus_.get(), tablet_prepare_pool);
   }
 
   RETURN_NOT_OK(prepare_thread_->Start());
@@ -284,7 +312,7 @@ Status TabletPeer::Start(const ConsensusBootstrapInfo& bootstrap_info) {
     VLOG(2) << "RaftConfig before starting: " << consensus_->CommittedConfig().DebugString();
 
     RETURN_NOT_OK(consensus_->Start(bootstrap_info));
-    RETURN_NOT_OK(UpdateState(TabletStatePB::BOOTSTRAPPING, TabletStatePB::RUNNING,
+    RETURN_NOT_OK(UpdateState(RaftGroupStatePB::BOOTSTRAPPING, RaftGroupStatePB::RUNNING,
                               "Incorrect state to start TabletPeer, "));
   }
   // The context tracks that the current caller does not hold the lock for consensus state.
@@ -295,7 +323,7 @@ Status TabletPeer::Start(const ConsensusBootstrapInfo& bootstrap_info) {
   // Because we changed the tablet state, we need to re-report the tablet to the master.
   mark_dirty_clbk_.Run(context);
 
-  return Status::OK();
+  return tablet_->EnableCompactions();
 }
 
 const consensus::RaftConfigPB TabletPeer::RaftConfig() const {
@@ -311,13 +339,14 @@ bool TabletPeer::StartShutdown() {
   }
 
   {
-    TabletStatePB state = state_.load(std::memory_order_acquire);
+    RaftGroupStatePB state = state_.load(std::memory_order_acquire);
     for (;;) {
-      if (state == TabletStatePB::QUIESCING || state == TabletStatePB::SHUTDOWN) {
+      if (state == RaftGroupStatePB::QUIESCING || state == RaftGroupStatePB::SHUTDOWN) {
         return false;
       }
       if (state_.compare_exchange_strong(
-          state, TabletStatePB::QUIESCING, std::memory_order_acq_rel)) {
+          state, RaftGroupStatePB::QUIESCING, std::memory_order_acq_rel)) {
+        LOG_WITH_PREFIX(INFO) << "Started shutdown from state: " << RaftGroupStatePB_Name(state);
         break;
       }
     }
@@ -338,6 +367,18 @@ bool TabletPeer::StartShutdown() {
 }
 
 void TabletPeer::CompleteShutdown() {
+  auto wait_start = CoarseMonoClock::now();
+  auto last_report = wait_start;
+  while (preparing_operations_.load(std::memory_order_acquire) != 0) {
+    auto now = CoarseMonoClock::now();
+    if (now > last_report + 10s) {
+      LOG_WITH_PREFIX(WARNING)
+          << "Long wait for finish of preparing operations: " << yb::ToString(now - wait_start);
+      last_report = now;
+    }
+    std::this_thread::sleep_for(100ms);
+  }
+
   // TODO: KUDU-183: Keep track of the pending tasks and send an "abort" message.
   LOG_SLOW_EXECUTION(WARNING, 1000,
       Substitute("TabletPeer: tablet $0: Waiting for Operations to complete", tablet_id())) {
@@ -349,12 +390,10 @@ void TabletPeer::CompleteShutdown() {
   }
 
   if (log_) {
-    WARN_NOT_OK(log_->Close(), "Error closing the Log.");
+    WARN_NOT_OK(log_->Close(), LogPrefix() + "Error closing the Log");
   }
 
-  if (VLOG_IS_ON(1)) {
-    VLOG_WITH_PREFIX(1) << "Shut down!";
-  }
+  VLOG_WITH_PREFIX(1) << "Shut down!";
 
   if (tablet_) {
     tablet_->Shutdown();
@@ -368,13 +407,15 @@ void TabletPeer::CompleteShutdown() {
     consensus_.reset();
     prepare_thread_.reset();
     tablet_.reset();
-    DCHECK_EQ(state_.load(std::memory_order_acquire), TabletStatePB::QUIESCING);
-    state_.store(TabletStatePB::SHUTDOWN, std::memory_order_release);
+    auto state = state_.load(std::memory_order_acquire);
+    LOG_IF_WITH_PREFIX(DFATAL, state != RaftGroupStatePB::QUIESCING) <<
+        "Bad state when completing shutdown: " << RaftGroupStatePB_Name(state);
+    state_.store(RaftGroupStatePB::SHUTDOWN, std::memory_order_release);
   }
 }
 
 void TabletPeer::WaitUntilShutdown() {
-  while (state_.load(std::memory_order_acquire) != TabletStatePB::SHUTDOWN) {
+  while (state_.load(std::memory_order_acquire) != RaftGroupStatePB::SHUTDOWN) {
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
 }
@@ -388,19 +429,21 @@ void TabletPeer::Shutdown() {
 }
 
 Status TabletPeer::CheckRunning() const {
-  if (state_.load(std::memory_order_acquire) != TabletStatePB::RUNNING) {
+  if (state_.load(std::memory_order_acquire) != RaftGroupStatePB::RUNNING) {
     return STATUS(IllegalState, Substitute("The tablet is not in a running state: $0",
-                                           TabletStatePB_Name(state_)));
+                                           RaftGroupStatePB_Name(state_)));
   }
+
   return Status::OK();
 }
 
 Status TabletPeer::CheckShutdownOrNotStarted() const {
-  TabletStatePB value = state_.load(std::memory_order_acquire);
-  if (value != TabletStatePB::SHUTDOWN && value != TabletStatePB::NOT_STARTED) {
+  RaftGroupStatePB value = state_.load(std::memory_order_acquire);
+  if (value != RaftGroupStatePB::SHUTDOWN && value != RaftGroupStatePB::NOT_STARTED) {
     return STATUS(IllegalState, Substitute("The tablet is not in a shutdown state: $0",
-                                           TabletStatePB_Name(value)));
+                                           RaftGroupStatePB_Name(value)));
   }
+
   return Status::OK();
 }
 
@@ -410,11 +453,11 @@ Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
   int backoff_exp = 0;
   const int kMaxBackoffExp = 8;
   while (true) {
-    TabletStatePB cached_state = state_.load(std::memory_order_acquire);
-    if (cached_state == TabletStatePB::QUIESCING || cached_state == TabletStatePB::SHUTDOWN) {
+    RaftGroupStatePB cached_state = state_.load(std::memory_order_acquire);
+    if (cached_state == RaftGroupStatePB::QUIESCING || cached_state == RaftGroupStatePB::SHUTDOWN) {
       return STATUS(IllegalState,
           Substitute("The tablet is already shutting down or shutdown. State: $0",
-                     TabletStatePB_Name(cached_state)));
+                     RaftGroupStatePB_Name(cached_state)));
     }
     if (cached_state == RUNNING && has_consensus_.load(std::memory_order_acquire) &&
         consensus_->IsRunning()) {
@@ -424,7 +467,7 @@ Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
     MonoDelta elapsed(now.GetDeltaSince(start));
     if (elapsed.MoreThan(timeout)) {
       return STATUS(TimedOut, Substitute("Consensus is not running after waiting for $0. State; $1",
-                                         elapsed.ToString(), TabletStatePB_Name(cached_state)));
+                                         elapsed.ToString(), RaftGroupStatePB_Name(cached_state)));
     }
     SleepFor(MonoDelta::FromMilliseconds(1 << backoff_exp));
     backoff_exp = std::min(backoff_exp + 1, kMaxBackoffExp);
@@ -432,25 +475,23 @@ Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
   return Status::OK();
 }
 
-void TabletPeer::WriteAsync(std::unique_ptr<WriteOperationState> state, MonoTime deadline) {
-  auto status = CheckRunning();
-  if (!status.ok()) {
-    state->completion_callback()->CompleteWithStatus(status);
+void TabletPeer::WriteAsync(
+    std::unique_ptr<WriteOperationState> state, int64_t term, CoarseTimePoint deadline) {
+  if (term == yb::OpId::kUnknownTerm) {
+    state->CompleteWithStatus(STATUS(IllegalState, "Write while not leader"));
     return;
   }
-  auto operation = std::make_unique<WriteOperation>(
-      std::move(state), consensus::LEADER, deadline, this);
-  tablet_->AcquireLocksAndPerformDocOperations(std::move(operation));
-}
 
-void TabletPeer::StartExecution(std::unique_ptr<Operation> operation) {
-  auto driver = NewLeaderOperationDriver(&operation);
-  if (driver.ok()) {
-    (**driver).ExecuteAsync();
-  } else {
-    auto status = driver.status();
-    operation->state()->completion_callback()->CompleteWithStatus(status);
+  preparing_operations_.fetch_add(1, std::memory_order_acq_rel);
+  auto status = CheckRunning();
+  if (!status.ok()) {
+    preparing_operations_.fetch_sub(1, std::memory_order_acq_rel);
+    state->CompleteWithStatus(status);
+    return;
   }
+
+  auto operation = std::make_unique<WriteOperation>(std::move(state), term, deadline, this);
+  tablet_->AcquireLocksAndPerformDocOperations(std::move(operation));
 }
 
 HybridTime TabletPeer::ReportReadRestart() {
@@ -458,11 +499,16 @@ HybridTime TabletPeer::ReportReadRestart() {
   return tablet_->SafeTime(RequireLease::kTrue);
 }
 
-void TabletPeer::Submit(std::unique_ptr<Operation> operation) {
+void TabletPeer::Aborted(Operation* operation) {
+  preparing_operations_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void TabletPeer::Submit(std::unique_ptr<Operation> operation, int64_t term) {
   auto status = CheckRunning();
 
+  auto operation_type = operation->operation_type();
   if (status.ok()) {
-    auto driver = NewLeaderOperationDriver(&operation);
+    auto driver = NewLeaderOperationDriver(&operation, term);
     if (driver.ok()) {
       (**driver).ExecuteAsync();
     } else {
@@ -471,12 +517,18 @@ void TabletPeer::Submit(std::unique_ptr<Operation> operation) {
   }
   if (!status.ok()) {
     operation->Finish(Operation::ABORTED);
-    operation->state()->completion_callback()->CompleteWithStatus(status);
+    operation->state()->CompleteWithStatus(status);
+  }
+
+  if (operation_type == OperationType::kWrite) {
+    preparing_operations_.fetch_sub(1, std::memory_order_acq_rel);
   }
 }
 
-void TabletPeer::SubmitUpdateTransaction(std::unique_ptr<UpdateTxnOperationState> state) {
-  Submit(std::make_unique<tablet::UpdateTxnOperation>(std::move(state), consensus::LEADER));
+void TabletPeer::SubmitUpdateTransaction(
+    std::unique_ptr<UpdateTxnOperationState> state, int64_t term) {
+  auto operation = std::make_unique<tablet::UpdateTxnOperation>(std::move(state));
+  Submit(std::move(operation), term);
 }
 
 HybridTime TabletPeer::Now() {
@@ -500,6 +552,7 @@ void TabletPeer::GetTabletStatusPB(TabletStatusPB* status_pb_out) const {
   DCHECK(status_listener_.get() != nullptr);
   status_pb_out->set_tablet_id(status_listener_->tablet_id());
   status_pb_out->set_table_name(status_listener_->table_name());
+  status_pb_out->set_table_id(status_listener_->table_id());
   status_pb_out->set_last_status(status_listener_->last_status());
   status_listener_->partition().ToPB(status_pb_out->mutable_partition());
   status_pb_out->set_state(state_);
@@ -517,12 +570,18 @@ Status TabletPeer::RunLogGC() {
   return log_->GC(min_log_index, &num_gced);
 }
 
+const TabletDataState TabletPeer::data_state() const {
+  std::lock_guard<simple_spinlock> lock(lock_);
+  return meta_->tablet_data_state();
+}
+
 string TabletPeer::HumanReadableState() const {
   std::lock_guard<simple_spinlock> lock(lock_);
   TabletDataState data_state = meta_->tablet_data_state();
+  RaftGroupStatePB state = this->state();
   // If failed, any number of things could have gone wrong.
-  if (state() == TabletStatePB::FAILED) {
-    return Substitute("$0 ($1): $2", TabletStatePB_Name(state_),
+  if (state == RaftGroupStatePB::FAILED) {
+    return Substitute("$0 ($1): $2", RaftGroupStatePB_Name(state),
                       TabletDataState_Name(data_state),
                       error_.get()->ToString());
   // If it's remotely bootstrapping, or tombstoned, that is the important thing
@@ -532,7 +591,7 @@ string TabletPeer::HumanReadableState() const {
   }
   // Otherwise, the tablet's data is in a "normal" state, so we just display
   // the runtime state (BOOTSTRAPPING, RUNNING, etc).
-  return TabletStatePB_Name(state_.load(std::memory_order_acquire));
+  return RaftGroupStatePB_Name(state);
 }
 
 namespace {
@@ -542,8 +601,8 @@ consensus::OperationType MapOperationTypeToPB(OperationType operation_type) {
     case OperationType::kWrite:
       return consensus::WRITE_OP;
 
-    case OperationType::kAlterSchema:
-      return consensus::ALTER_SCHEMA_OP;
+    case OperationType::kChangeMetadata:
+      return consensus::CHANGE_METADATA_OP;
 
     case OperationType::kUpdateTransaction:
       return consensus::UPDATE_TRANSACTION_OP;
@@ -622,6 +681,8 @@ Status TabletPeer::GetEarliestNeededLogIndex(int64_t* min_index) const {
     }
   }
 
+  *min_index = std::min(*min_index, consensus_->MinRetryableRequestOpId().index);
+
   auto* transaction_coordinator = tablet()->transaction_coordinator();
   if (transaction_coordinator) {
     *min_index = std::min(*min_index, transaction_coordinator->PrepareGC());
@@ -670,7 +731,7 @@ Status TabletPeer::GetGCableDataSize(int64_t* retention_size) const {
   RETURN_NOT_OK(CheckRunning());
   int64_t min_op_idx;
   RETURN_NOT_OK(GetEarliestNeededLogIndex(&min_op_idx));
-  log_->GetGCableDataSize(min_op_idx, retention_size);
+  RETURN_NOT_OK(log_->GetGCableDataSize(min_op_idx, retention_size));
   return Status::OK();
 }
 
@@ -694,28 +755,33 @@ std::unique_ptr<Operation> TabletPeer::CreateOperation(consensus::ReplicateMsg* 
       DCHECK(replicate_msg->has_write_request()) << "WRITE_OP replica"
           " operation must receive a WriteRequestPB";
       return std::make_unique<WriteOperation>(
-          std::make_unique<WriteOperationState>(tablet()), consensus::REPLICA, MonoTime::Max(),
-          this);
+          std::make_unique<WriteOperationState>(tablet()), yb::OpId::kUnknownTerm,
+          CoarseTimePoint::max(), this);
 
-    case consensus::ALTER_SCHEMA_OP:
-      DCHECK(replicate_msg->has_alter_schema_request()) << "ALTER_SCHEMA_OP replica"
-          " operation must receive an AlterSchemaRequestPB";
-      return std::make_unique<AlterSchemaOperation>(
-          std::make_unique<AlterSchemaOperationState>(tablet(), log()), consensus::REPLICA);
+    case consensus::CHANGE_METADATA_OP:
+      DCHECK(replicate_msg->has_change_metadata_request()) << "CHANGE_METADATA_OP replica"
+          " operation must receive an ChangeMetadataRequestPB";
+      return std::make_unique<ChangeMetadataOperation>(
+          std::make_unique<ChangeMetadataOperationState>(tablet(), log()));
 
     case consensus::UPDATE_TRANSACTION_OP:
       DCHECK(replicate_msg->has_transaction_state()) << "UPDATE_TRANSACTION_OP replica"
           " operation must receive an TransactionStatePB";
       return std::make_unique<UpdateTxnOperation>(
-          std::make_unique<UpdateTxnOperationState>(tablet()), consensus::REPLICA);
+          std::make_unique<UpdateTxnOperationState>(tablet()));
 
     case consensus::TRUNCATE_OP:
       DCHECK(replicate_msg->has_truncate_request()) << "TRUNCATE_OP replica"
           " operation must receive an TruncateRequestPB";
       return std::make_unique<TruncateOperation>(
-          std::make_unique<TruncateOperationState>(tablet()), consensus::REPLICA);
+          std::make_unique<TruncateOperationState>(tablet()));
 
-    case consensus::SNAPSHOT_OP: FALLTHROUGH_INTENDED;
+    case consensus::SNAPSHOT_OP:
+       DCHECK(replicate_msg->has_snapshot_request()) << "SNAPSHOT_OP replica"
+          " transaction must receive an TabletSnapshotOpRequestPB";
+      return std::make_unique<SnapshotOperation>(
+          std::make_unique<SnapshotOperationState>(tablet()));
+
     case consensus::UNKNOWN_OP: FALLTHROUGH_INTENDED;
     case consensus::NO_OP: FALLTHROUGH_INTENDED;
     case consensus::CHANGE_CONFIG_OP:
@@ -726,9 +792,9 @@ std::unique_ptr<Operation> TabletPeer::CreateOperation(consensus::ReplicateMsg* 
 
 Status TabletPeer::StartReplicaOperation(
     const scoped_refptr<ConsensusRound>& round, HybridTime propagated_safe_time) {
-  TabletStatePB value = state();
-  if (value != TabletStatePB::RUNNING && value != TabletStatePB::BOOTSTRAPPING) {
-    return STATUS(IllegalState, TabletStatePB_Name(value));
+  RaftGroupStatePB value = state();
+  if (value != RaftGroupStatePB::RUNNING && value != RaftGroupStatePB::BOOTSTRAPPING) {
+    return STATUS(IllegalState, RaftGroupStatePB_Name(value));
   }
 
   consensus::ReplicateMsg* replicate_msg = round->replicate_msg().get();
@@ -751,7 +817,7 @@ Status TabletPeer::StartReplicaOperation(
 
   // Unretained is required to avoid a refcount cycle.
   state->consensus_round()->SetConsensusReplicatedCallback(
-      std::bind(&OperationDriver::ReplicationFinished, driver.get(), std::placeholders::_1));
+      std::bind(&OperationDriver::ReplicationFinished, driver.get(), _1, _2));
 
   if (propagated_safe_time) {
     driver->SetPropagatedSafeTime(propagated_safe_time, tablet_->mvcc_manager());
@@ -770,21 +836,8 @@ void TabletPeer::SetPropagatedSafeTime(HybridTime ht) {
   (**driver).ExecuteAsync();
 }
 
-const std::string& TabletPeer::permanent_uuid() const {
-  if (cached_permanent_uuid_initialized_.load(std::memory_order_acquire)) {
-    return cached_permanent_uuid_;
-  }
-  std::lock_guard<simple_spinlock> lock(lock_);
-  if (tablet_ == nullptr) {
-    static std::string empty_string;
-    return empty_string;
-  }
-
-  if (!cached_permanent_uuid_initialized_.load(std::memory_order_acquire)) {
-    cached_permanent_uuid_ = tablet_->metadata()->fs_manager()->uuid();
-    cached_permanent_uuid_initialized_.store(true, std::memory_order_release);
-  }
-  return cached_permanent_uuid_;
+bool TabletPeer::ShouldApplyWrite() {
+  return tablet_->ShouldApplyWrite();
 }
 
 consensus::Consensus* TabletPeer::consensus() const {
@@ -798,19 +851,19 @@ shared_ptr<consensus::Consensus> TabletPeer::shared_consensus() const {
 }
 
 Result<OperationDriverPtr> TabletPeer::NewLeaderOperationDriver(
-    std::unique_ptr<Operation>* operation) {
-  return NewOperationDriver(operation, consensus::LEADER);
+    std::unique_ptr<Operation>* operation, int64_t term) {
+  return NewOperationDriver(operation, term);
 }
 
 Result<OperationDriverPtr> TabletPeer::NewReplicaOperationDriver(
     std::unique_ptr<Operation>* operation) {
-  return NewOperationDriver(operation, consensus::REPLICA);
+  return NewOperationDriver(operation, yb::OpId::kUnknownTerm);
 }
 
 Result<OperationDriverPtr> TabletPeer::NewOperationDriver(std::unique_ptr<Operation>* operation,
-                                                          consensus::DriverType type) {
+                                                          int64_t term) {
   auto operation_driver = CreateOperationDriver();
-  RETURN_NOT_OK(operation_driver->Init(operation, type));
+  RETURN_NOT_OK(operation_driver->Init(operation, term));
   return operation_driver;
 }
 
@@ -822,7 +875,7 @@ void TabletPeer::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
 
   std::lock_guard<simple_spinlock> l(state_change_lock_);
 
-  if (state() != TabletStatePB::RUNNING) {
+  if (state() != RaftGroupStatePB::RUNNING) {
     LOG_WITH_PREFIX(WARNING) << "Not registering maintenance operations: tablet not RUNNING";
     return;
   }
@@ -862,7 +915,7 @@ uint64_t TabletPeer::OnDiskSize() const {
 
 std::string TabletPeer::LogPrefix() const {
   return Substitute("T $0 P $1 [state=$2]: ",
-      tablet_id_, cached_permanent_uuid_, TabletStatePB_Name(state()));
+      tablet_id_, permanent_uuid_, RaftGroupStatePB_Name(state()));
 }
 
 scoped_refptr<OperationDriver> TabletPeer::CreateOperationDriver() {
@@ -875,23 +928,70 @@ scoped_refptr<OperationDriver> TabletPeer::CreateOperationDriver() {
       tablet_->table_type()));
 }
 
-consensus::Consensus::LeaderStatus TabletPeer::LeaderStatus() const {
+int64_t TabletPeer::LeaderTerm() const {
   shared_ptr<consensus::Consensus> consensus;
   {
     std::lock_guard<simple_spinlock> lock(lock_);
     consensus = consensus_;
   }
-  return consensus ? consensus->leader_status() : consensus::Consensus::LeaderStatus::NOT_LEADER;
+  return consensus ? consensus->LeaderTerm() : yb::OpId::kUnknownTerm;
+}
+
+consensus::LeaderStatus TabletPeer::LeaderStatus() const {
+  shared_ptr<consensus::Consensus> consensus;
+  {
+    std::lock_guard<simple_spinlock> lock(lock_);
+    consensus = consensus_;
+  }
+  return consensus ? consensus->GetLeaderStatus() : consensus::LeaderStatus::NOT_LEADER;
 }
 
 HybridTime TabletPeer::HtLeaseExpiration() const {
-  HybridTime result(consensus_->MajorityReplicatedHtLeaseExpiration(0, MonoTime::kMax), 0);
+  HybridTime result(consensus_->MajorityReplicatedHtLeaseExpiration(0, CoarseTimePoint::max()), 0);
   return std::max(result, tablet_->mvcc_manager()->LastReplicatedHybridTime());
 }
 
 TableType TabletPeer::table_type() {
   // TODO: what if tablet is not set?
   return tablet()->table_type();
+}
+
+void TabletPeer::SetFailed(const Status& error) {
+  DCHECK(error_.get(std::memory_order_acquire) == nullptr);
+  error_ = MakeAtomicUniquePtr<Status>(error);
+  auto state = state_.load(std::memory_order_acquire);
+  while (state != RaftGroupStatePB::FAILED && state != RaftGroupStatePB::QUIESCING &&
+         state != RaftGroupStatePB::SHUTDOWN) {
+    if (state_.compare_exchange_weak(state, RaftGroupStatePB::FAILED, std::memory_order_acq_rel)) {
+      LOG_WITH_PREFIX(INFO) << "Changed state from " << RaftGroupStatePB_Name(state)
+                            << " to FAILED";
+      break;
+    }
+  }
+}
+
+Status TabletPeer::UpdateState(RaftGroupStatePB expected, RaftGroupStatePB new_state,
+                               const std::string& error_message) {
+  RaftGroupStatePB old = expected;
+  if (!state_.compare_exchange_strong(old, new_state, std::memory_order_acq_rel)) {
+    return STATUS_FORMAT(
+        InvalidArgument, "$0 Expected state: $1, got: $2",
+        error_message, RaftGroupStatePB_Name(expected), RaftGroupStatePB_Name(old));
+  }
+
+  LOG_WITH_PREFIX(INFO) << "Changed state from " << RaftGroupStatePB_Name(old) << " to "
+                        << RaftGroupStatePB_Name(new_state);
+  return Status::OK();
+}
+
+bool TabletPeer::Enqueue(rpc::ThreadPoolTask* task) {
+  rpc::ThreadPool* thread_pool = service_thread_pool_.load(std::memory_order_acquire);
+  if (!thread_pool) {
+    task->Done(STATUS(Aborted, "Thread pool not ready"));
+    return false;
+  }
+
+  return thread_pool->Enqueue(task);
 }
 
 }  // namespace tablet

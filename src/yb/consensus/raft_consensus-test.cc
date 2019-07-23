@@ -83,7 +83,8 @@ class MockQueue : public PeerMessageQueue {
   explicit MockQueue(const scoped_refptr<MetricEntity>& metric_entity, log::Log* log,
                      const server::ClockPtr& clock,
                      std::unique_ptr<ThreadPoolToken> raft_pool_observers_token)
-      : PeerMessageQueue(metric_entity, log, FakeRaftPeerPB(kLocalPeerUuid), kTestTablet, clock,
+      : PeerMessageQueue(metric_entity, log, nullptr /* server_tracker */,
+                         FakeRaftPeerPB(kLocalPeerUuid), kTestTablet, clock,
                          std::move(raft_pool_observers_token)) {}
 
   MOCK_METHOD1(Init, void(const OpId& locally_replicated_index));
@@ -91,17 +92,19 @@ class MockQueue : public PeerMessageQueue {
                                    int64_t current_term,
                                    const RaftConfigPB& active_config));
   MOCK_METHOD0(SetNonLeaderMode, void());
-  virtual Status AppendOperations(const ReplicateMsgs& msgs,
-                                  const StatusCallback& callback) override {
-    return AppendOperationsMock(msgs, callback);
+  Status AppendOperations(const ReplicateMsgs& msgs,
+                          const yb::OpId& committed_op_id,
+                          RestartSafeCoarseTimePoint time) override {
+    return AppendOperationsMock(msgs, committed_op_id, time);
   }
-  MOCK_METHOD2(AppendOperationsMock, Status(const ReplicateMsgs& msgs,
-                                            const StatusCallback& callback));
+  MOCK_METHOD3(AppendOperationsMock, Status(const ReplicateMsgs& msgs,
+                                            const yb::OpId& committed_op_id,
+                                            RestartSafeCoarseTimePoint time));
   MOCK_METHOD1(TrackPeer, void(const string&));
   MOCK_METHOD1(UntrackPeer, void(const string&));
   MOCK_METHOD6(RequestForPeer, Status(const std::string& uuid,
                                       ConsensusRequestPB* request,
-                                      ReplicateMsgs* msg_refs,
+                                      ReplicateMsgsHolder* msgs_holder,
                                       bool* needs_remote_bootstrap,
                                       RaftPeerPB::MemberType* member_type,
                                       bool* last_exchange_successful));
@@ -151,7 +154,7 @@ class RaftConsensusSpy : public RaftConsensus {
                     parent_mem_tracker,
                     mark_dirty_clbk,
                     YQL_TABLE_TYPE,
-                    LostLeadershipListener()) {
+                    nullptr /* retryable_requests */) {
     // These "aliases" allow us to count invocations and assert on them.
     ON_CALL(*this, StartConsensusOnlyRoundUnlocked(_))
         .WillByDefault(Invoke(this,
@@ -216,9 +219,9 @@ class RaftConsensusTest : public YBTest {
     ASSERT_OK(fs_manager_->Open());
     ASSERT_OK(ThreadPoolBuilder("append").Build(&append_pool_));
     ASSERT_OK(Log::Open(LogOptions(),
-                       fs_manager_.get(),
                        kTestTablet,
                        fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet),
+                       fs_manager_->uuid(),
                        schema_,
                        0, // schema_version
                        nullptr, // metric_entity
@@ -234,7 +237,7 @@ class RaftConsensusTest : public YBTest {
     peer_manager_ = new MockPeerManager;
     operation_factory_.reset(new MockOperationFactory);
 
-    ON_CALL(*queue_, AppendOperationsMock(_, _))
+    ON_CALL(*queue_, AppendOperationsMock(_, _, _))
         .WillByDefault(Invoke(this, &RaftConsensusTest::AppendToLog));
   }
 
@@ -274,15 +277,14 @@ class RaftConsensusTest : public YBTest {
   }
 
   Status AppendToLog(const ReplicateMsgs& msgs,
-                     const StatusCallback& callback) {
-    return log_->AsyncAppendReplicates(msgs,
-                                       Bind(LogAppendCallback, callback));
+                     const yb::OpId& committed_op_id,
+                     RestartSafeCoarseTimePoint time) {
+    return log_->AsyncAppendReplicates(msgs, committed_op_id, time,
+                                       Bind(LogAppendCallback));
   }
 
-  static void LogAppendCallback(const StatusCallback& callback,
-                                const Status& s) {
+  static void LogAppendCallback(const Status& s) {
     ASSERT_OK(s);
-    callback.Run(s);
   }
 
   Status MockAppendNewRound(const scoped_refptr<ConsensusRound>& round) {
@@ -330,7 +332,7 @@ class RaftConsensusTest : public YBTest {
         std::bind(&RaftConsensusSpy::NonTxRoundReplicationFinished,
              consensus_.get(), round.get(), &DoNothingStatusCB, std::placeholders::_1));
 
-    CHECK_OK(consensus_->Replicate(round));
+    CHECK_OK(consensus_->TEST_Replicate(round));
     LOG(INFO) << "Appended NO_OP round with opid " << round->id();
     return round;
   }
@@ -403,8 +405,8 @@ TEST_F(RaftConsensusTest, TestCommittedIndexWhenInSameTerm) {
       .Times(1);
   EXPECT_CALL(*consensus_.get(), AppendNewRoundsToQueueUnlocked(_))
       .Times(11);
-  EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
-      .Times(11).WillRepeatedly(Return(Status::OK()));
+  EXPECT_CALL(*queue_, AppendOperationsMock(_, _, _))
+      .Times(22).WillRepeatedly(Return(Status::OK()));
 
   ConsensusBootstrapInfo info;
   ASSERT_OK(consensus_->Start(info));
@@ -440,8 +442,8 @@ TEST_F(RaftConsensusTest, TestCommittedIndexWhenTermsChange) {
       .Times(3);
   EXPECT_CALL(*consensus_.get(), AppendNewRoundToQueueUnlocked(_))
       .Times(2);
-  EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
-      .Times(3).WillRepeatedly(Return(Status::OK()));;
+  EXPECT_CALL(*queue_, AppendOperationsMock(_, _, _))
+      .Times(5).WillRepeatedly(Return(Status::OK()));;
 
   ConsensusBootstrapInfo info;
   ASSERT_OK(consensus_->Start(info));
@@ -527,10 +529,10 @@ TEST_F(RaftConsensusTest, TestPendingOperations) {
     EXPECT_CALL(*peer_manager_, UpdateRaftConfig(_))
         .Times(1);
     // The no-op should be appended to the queue.
-    // One more op will be appended for the election.
     EXPECT_CALL(*consensus_.get(), AppendNewRoundToQueueUnlocked(_))
         .Times(1);
-    EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
+    // One more op will be appended for the election.
+    EXPECT_CALL(*queue_, AppendOperationsMock(_, _, _))
         .Times(1).WillRepeatedly(Return(Status::OK()));;
   }
 
@@ -602,8 +604,8 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
 
   // We'll append to the queue 12 times, the initial noop txn + 10 initial ops while leader
   // and the new leader's update, when we're overwriting operations.
-  EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
-      .Times(12);
+  EXPECT_CALL(*queue_, AppendOperationsMock(_, _, _))
+      .Times(13);
 
   // .. but those will be overwritten later by another
   // leader, which will push and commit 5 ops.
@@ -671,7 +673,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
   request.mutable_committed_index()->CopyFrom(MakeOpId(3, 6));
 
   ConsensusResponsePB response;
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.has_error());
 
   ASSERT_TRUE(Mock::VerifyAndClearExpectations(consensus_.get()));
@@ -686,7 +688,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
   request.mutable_preceding_id()->CopyFrom(MakeOpId(3, 9));
   request.mutable_committed_index()->CopyFrom(MakeOpId(3, 9));
 
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.has_error());
 }
 
@@ -720,7 +722,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   // Heartbeat. This will cause the term to increment on the follower.
   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_EQ(caller_term, response.responder_term());
   ASSERT_OPID_EQ(response.status().last_received(), MinimumOpId());
@@ -730,7 +732,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   OpId noop_opid = MakeOpId(caller_term, ++log_index);
   AddNoOpToConsensusRequest(&request, noop_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);
   ASSERT_OPID_EQ(response.status().last_received_current_leader(),  noop_opid);
@@ -743,7 +745,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   preceding_opid = noop_opid;
   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_EQ(caller_term, response.responder_term());
   ASSERT_OPID_EQ(response.status().last_received(), preceding_opid);
@@ -753,7 +755,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   noop_opid = MakeOpId(caller_term, ++log_index);
   AddNoOpToConsensusRequest(&request, noop_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);
   ASSERT_OPID_EQ(response.status().last_received_current_leader(), noop_opid);
@@ -764,7 +766,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   preceding_opid = MakeOpId(caller_term, log_index + 1); // Not replicated yet.
   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_EQ(caller_term, response.responder_term());
   ASSERT_OPID_EQ(response.status().last_received(), noop_opid); // Not preceding this time.
   ASSERT_OPID_EQ(response.status().last_received_current_leader(), MinimumOpId());
@@ -777,7 +779,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
   AddNoOpToConsensusRequest(&request, noop_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_OPID_EQ(response.status().last_received(), noop_opid) << response.ShortDebugString();
   ASSERT_OPID_EQ(response.status().last_received_current_leader(), noop_opid)
@@ -792,7 +794,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
   AddNoOpToConsensusRequest(&request, noop_opid);
   response.Clear();
-  ASSERT_OK(consensus_->Update(&request, &response));
+  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_EQ(caller_term, response.responder_term());
   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);

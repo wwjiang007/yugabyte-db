@@ -43,7 +43,6 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/yql/redis/redisserver/redis_server.h"
 #include "yb/yql/cql/cqlserver/cql_server.h"
-#include "yb/yql/pgsql/server/pg_server.h"
 #include "yb/master/call_home.h"
 #include "yb/rpc/io_thread_pool.h"
 #include "yb/rpc/scheduler.h"
@@ -55,6 +54,7 @@
 #include "yb/util/logging.h"
 #include "yb/util/main_util.h"
 #include "yb/util/size_literals.h"
+#include "yb/yql/pgwrapper/pg_wrapper.h"
 
 using namespace std::placeholders;
 
@@ -64,9 +64,11 @@ using yb::redisserver::RedisServerOptions;
 using yb::cqlserver::CQLServer;
 using yb::cqlserver::CQLServerOptions;
 
+using yb::pgwrapper::PgProcessConf;
+using yb::pgwrapper::PgWrapper;
+using yb::pgwrapper::PgSupervisor;
+
 using namespace yb::size_literals;  // NOLINT
-using yb::pgserver::PgServer;
-using yb::pgserver::PgServerOptions;
 
 DEFINE_bool(start_redis_proxy, true, "Starts a redis proxy along with the tablet server");
 
@@ -77,8 +79,6 @@ DEFINE_string(cql_proxy_broadcast_rpc_address, "",
 
 DEFINE_int64(tserver_tcmalloc_max_total_thread_cache_bytes, 256_MB, "Total number of bytes to "
     "use for the thread cache for tcmalloc across all threads in the tserver.");
-
-DEFINE_bool(start_pgsql_proxy, true, "Starts a PostgreSQL proxy along with the tablet server");
 
 DECLARE_string(rpc_bind_addresses);
 DECLARE_bool(callhome_enabled);
@@ -93,7 +93,14 @@ DECLARE_string(cql_proxy_bind_address);
 DECLARE_int32(cql_proxy_webserver_port);
 
 DECLARE_string(pgsql_proxy_bind_address);
-DECLARE_int32(pgsql_proxy_webserver_port);
+DECLARE_bool(start_pgsql_proxy);
+DECLARE_bool(enable_ysql);
+
+DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
+
+// Deprecated because it's misspelled.  But if set, this flag takes precedence over
+// remote_bootstrap_rate_limit_bytes_per_sec for compatibility.
+DECLARE_int64(remote_boostrap_rate_limit_bytes_per_sec);
 
 namespace yb {
 namespace tserver {
@@ -113,9 +120,6 @@ static int TabletServerMain(int argc, char** argv) {
   // ERRORs, and FATALs will still cause a sync to disk.
   FLAGS_logbuflevel = google::GLOG_WARNING;
 
-  FLAGS_pgsql_proxy_bind_address = strings::Substitute("0.0.0.0:$0", PgServer::kDefaultPort);
-  FLAGS_pgsql_proxy_webserver_port = PgServer::kDefaultWebPort;
-
   // Only write FATALs by default to stderr.
   FLAGS_stderrthreshold = google::FATAL;
 
@@ -126,6 +130,15 @@ static int TabletServerMain(int argc, char** argv) {
   }
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(log::ModifyDurableWriteFlagIfNotODirect());
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(InitYB(TabletServerOptions::kServerType, argv[0]));
+
+  LOG(INFO) << "NumCPUs determined to be: " << base::NumCPUs();
+
+  if (FLAGS_remote_boostrap_rate_limit_bytes_per_sec > 0) {
+    LOG(WARNING) << "Flag remote_boostrap_rate_limit_bytes_per_sec has been deprecated. "
+                 << "Use remote_bootstrap_rate_limit_bytes_per_sec flag instead";
+    FLAGS_remote_bootstrap_rate_limit_bytes_per_sec =
+        FLAGS_remote_boostrap_rate_limit_bytes_per_sec;
+  }
 
 #ifdef TCMALLOC_ENABLED
   LOG(INFO) << "Setting tcmalloc max thread cache bytes to: " <<
@@ -143,6 +156,29 @@ static int TabletServerMain(int argc, char** argv) {
   YB_EDITION_NS_PREFIX Factory factory;
 
   auto server = factory.CreateTabletServer(*tablet_server_options);
+
+  boost::optional<PgProcessConf> pg_process_conf;
+  std::unique_ptr<PgSupervisor> pg_supervisor;
+  if (FLAGS_start_pgsql_proxy || FLAGS_enable_ysql) {
+    auto pg_process_conf_result = PgProcessConf::CreateValidateAndRunInitDb(
+        FLAGS_pgsql_proxy_bind_address,
+        tablet_server_options->fs_opts.data_paths.front() + "/pg_data",
+        server->GetSharedMemoryFd());
+    LOG_AND_RETURN_FROM_MAIN_NOT_OK(pg_process_conf_result);
+    pg_process_conf = std::move(*pg_process_conf_result);
+    pg_process_conf->master_addresses = tablet_server_options->master_addresses_flag;
+
+    LOG(INFO) << "Starting PostgreSQL server listening on "
+              << pg_process_conf->listen_addresses << ", port " << pg_process_conf->pg_port;
+
+    pg_supervisor = std::make_unique<PgSupervisor>(*pg_process_conf);
+    LOG_AND_RETURN_FROM_MAIN_NOT_OK(pg_supervisor->Start());
+  }
+
+  // ----------------------------------------------------------------------------------------------
+  // Starting to instantiate servers
+  // ----------------------------------------------------------------------------------------------
+
   LOG(INFO) << "Initializing tablet server...";
   LOG_AND_RETURN_FROM_MAIN_NOT_OK(server->Init());
   LOG(INFO) << "Starting tablet server...";
@@ -170,23 +206,6 @@ static int TabletServerMain(int argc, char** argv) {
     LOG(INFO) << "Starting redis server...";
     LOG_AND_RETURN_FROM_MAIN_NOT_OK(redis_server->Start());
     LOG(INFO) << "Redis server successfully started.";
-  }
-
-  std::unique_ptr<PgServer> pgsql_server;
-  if (FLAGS_start_pgsql_proxy) {
-    PgServerOptions pgsql_server_options;
-    pgsql_server_options.rpc_opts.rpc_bind_addresses = FLAGS_pgsql_proxy_bind_address;
-    pgsql_server_options.webserver_opts.port = FLAGS_pgsql_proxy_webserver_port;
-    pgsql_server_options.master_addresses_flag = tablet_server_options->master_addresses_flag;
-    pgsql_server_options.SetMasterAddresses(tablet_server_options->GetMasterAddresses());
-    pgsql_server_options.dump_info_path =
-        (tablet_server_options->dump_info_path.empty()
-             ? ""
-             : tablet_server_options->dump_info_path + "-pgsql");
-    pgsql_server.reset(new PgServer(pgsql_server_options, server.get()));
-    LOG(INFO) << "Starting Postgresql server...";
-    LOG_AND_RETURN_FROM_MAIN_NOT_OK(pgsql_server->Start());
-    LOG(INFO) << "Postgresql server successfully started.";
   }
 
   // TODO(neil): After CQL server is starting, it blocks this thread from moving on.

@@ -39,9 +39,15 @@
 
 #include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/error.h"
 #include "yb/client/schema.h"
+#include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
@@ -130,10 +136,10 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(cluster_->Start());
     ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas()));
 
-    CHECK_OK(YBClientBuilder()
-             .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-             .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
-             .Build(&client_));
+    client_ = CHECK_RESULT(YBClientBuilder()
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .default_admin_operation_timeout(MonoDelta::FromSeconds(60))
+        .Build());
 
     CHECK_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
 
@@ -152,6 +158,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void DoTearDown() override {
+    client_.reset();
     tablet_peer_.reset();
     cluster_->Shutdown();
   }
@@ -191,7 +198,8 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
     int wait_time = 1000;
     for (int i = 0; i < attempts; ++i) {
       bool in_progress;
-      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, &in_progress));
+      string table_id;
+      RETURN_NOT_OK(client_->IsAlterTableInProgress(table_name, table_id, &in_progress));
       if (!in_progress) {
         return Status::OK();
       }
@@ -248,7 +256,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster> {
 
   static const YBTableName kTableName;
 
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
 
   YBSchema schema_;
 
@@ -329,9 +337,10 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   YBSchema schema;
   PartitionSchema partition_schema;
   bool alter_in_progress = false;
+  string table_id;
   ASSERT_OK(client_->GetTableSchema(kTableName, &schema, &partition_schema));
   ASSERT_TRUE(schema_.Equals(schema));
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_TRUE(alter_in_progress);
 
   // Restart the TS and wait for the new schema
@@ -510,7 +519,7 @@ TEST_F(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Inserting rows";
   InsertRows(0, 3);
 
-  std::string docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  std::string docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
   // DocDB should not be empty right now.
   ASSERT_NE(0, docdb_dump.length());
 
@@ -521,7 +530,7 @@ TEST_F(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Forcing compaction";
   tablet_peer_->tablet()->ForceRocksDBCompactInTest();
 
-  docdb_dump = tablet_peer_->tablet()->DocDBDumpStrInTest();
+  docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
 
   LOG(INFO) << "Checking that docdb is empty";
   ASSERT_EQ("", docdb_dump);
@@ -877,7 +886,8 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   ASSERT_OK(AddNewI32Column(kTableName, "c1"));
 
   bool alter_in_progress;
-  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &alter_in_progress));
+  string table_id;
+  ASSERT_OK(client_->IsAlterTableInProgress(kTableName, table_id, &alter_in_progress));
   ASSERT_FALSE(alter_in_progress);
 
   LOG(INFO) << "Verifying that the new default shows up";

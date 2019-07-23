@@ -67,6 +67,22 @@ helm install yugabyte --set resource.tserver.requests.cpu=8,resource.tserver.req
 helm install yugabyte --set resource.tserver.limits.cpu=16,resource.tserver.limits.memory=30Gi --namespace yb-demo --name yb-demo --wait
 ```
 
+#### Creating YugaByte cluster with Cassandra authentication enabled.
+```
+helm install yugabyte --set gflags.tserver.use_cassandra_authentication=true --namespace yb-demo --name yb-demo --wait
+```
+
+#### Create YugaByte cluster with larger disk.
+The default helm chart brings up a YugaByte DB with 10Gi for master nodes and 10Gi for tserver nodes. You override those defaults as below.
+```
+helm install yugabyte --set storage.tserver.size=100Gi --namespace yb-demo --name yb-demo --wait
+```
+
+#### Create YugaByte cluster with different storage class.
+```
+helm install yugabyte --set storage.tserver.storageClass=custom-storage,storage.master.storageClass=custom-storage --namespace yb-demo --name yb-demo --wait
+```
+
 ### Exposing YugaByte service endpoints using LoadBalancer
 By default YugaByte helm would expose the master ui endpoint alone via LoadBalancer. If you wish to expose yql, yedis services
 via LoadBalancer for your app to use, you could do that in couple of different ways.
@@ -74,13 +90,26 @@ via LoadBalancer for your app to use, you could do that in couple of different w
 #### Exposing individual service endpoint
 If you want individual LoadBalancer endpoint for each of the services (YQL, YEDIS), run the following command
 ```
-helm install yugabyte expose-all.yaml --namespace yb-demo --name yb-demo --wait
+helm install yugabyte -f expose-all.yaml --namespace yb-demo --name yb-demo --wait
 ```
 
 #### Exposing shared service endpoint
 If you want to create a shared LoadBalancer endpoint for all the services (YQL, YEDIS), run the following command
 ```
-helm install yugabyte expose-all-shared.yaml --namespace yb-demo --name yb-demo --wait
+helm install yugabyte -f expose-all-shared.yaml --namespace yb-demo --name yb-demo --wait
 ```
+#### Enable TLS for YugaByte (Note: This is only available for Enterprise Edition)
+The assumption here is you already have the pull secret installed to pull from our private Enterprise Edition registry
+YugaByte has three gflags that help build the level on encryption you need,
+Following two flags applies to both master and tserver
+`use_node_to_node_encryption` whether or not you would want to enable node to node encryption
+`allow_insecure_connections` whether or not you would want to have insecure connections allowed when tls is enabled
 
+Following flag only applies to tserver
+`use_client_to_server_encryption` whether or not you would want to enable client to node encryption, node enabling this
+would mean your apps should have the certificate to talk to the database.
+
+```
+helm install yugabyte --namespace yb-demo --name yb-demo --set=tls.enabled=true,Image.repository=quay.io/yugabyte/yugabyte,gflags.master.use_node_to_node_encryption=true,gflags.tserver.use_node_to_node_encryption=true,gflags.master.allow_insecure_connections=false,gflags.tserver.allow_insecure_connections=false,Image.pullSecretName=yugabyte-k8s-pull-secret --wait
+```
 Follow the instructions on the NOTES section.

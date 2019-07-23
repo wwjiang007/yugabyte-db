@@ -37,6 +37,7 @@
 #include "yb/common/hybrid_time.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/common/wire_protocol-test-util.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_reader.h"
@@ -65,6 +66,8 @@ METRIC_DECLARE_entity(tablet);
 
 DECLARE_int32(log_min_seconds_to_retain);
 
+DECLARE_bool(quick_leader_election_on_create);
+
 namespace yb {
 namespace tablet {
 
@@ -81,7 +84,6 @@ using docdb::KeyValueWriteBatchPB;
 using log::Log;
 using log::LogAnchorRegistry;
 using log::LogOptions;
-using rpc::Messenger;
 using server::Clock;
 using server::LogicalClock;
 using std::shared_ptr;
@@ -115,7 +117,7 @@ class TabletPeerTest : public YBTabletTest,
 
     rpc::MessengerBuilder builder(CURRENT_TEST_NAME());
     messenger_ = ASSERT_RESULT(builder.Build());
-    proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_);
+    proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_.get());
 
     metric_entity_ = METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "test-tablet");
 
@@ -128,15 +130,19 @@ class TabletPeerTest : public YBTabletTest,
 
     // "Bootstrap" and start the TabletPeer.
     tablet_peer_.reset(
-      new TabletPeerClass(make_scoped_refptr(tablet()->metadata()),
-                          config_peer,
-                          Bind(&TabletPeerTest::TabletPeerStateChangedCallback,
-                               Unretained(this),
-                               tablet()->tablet_id())));
+        new TabletPeer(
+            make_scoped_refptr(tablet()->metadata()),
+            config_peer,
+            clock(),
+            tablet()->metadata()->fs_manager()->uuid(),
+            Bind(
+                &TabletPeerTest::TabletPeerStateChangedCallback,
+                Unretained(this),
+                tablet()->tablet_id())));
 
     // Make TabletPeer use the same LogAnchorRegistry as the Tablet created by the harness.
     // TODO: Refactor TabletHarness to allow taking a LogAnchorRegistry, while also providing
-    // TabletMetadata for consumption by TabletPeer before Tablet is instantiated.
+    // RaftGroupMetadata for consumption by TabletPeer before Tablet is instantiated.
     tablet_peer_->log_anchor_registry_ = tablet()->log_anchor_registry_;
 
     consensus::RaftConfigPB config;
@@ -155,29 +161,35 @@ class TabletPeerTest : public YBTabletTest,
                  .unlimited_threads()
                  .Build(&append_pool_));
     scoped_refptr<Log> log;
-    ASSERT_OK(Log::Open(LogOptions(), fs_manager(), tablet()->tablet_id(),
-                        tablet()->metadata()->wal_dir(), *tablet()->schema(),
-                        tablet()->metadata()->schema_version(), metric_entity_.get(),
-                        append_pool_.get(), &log));
+    ASSERT_OK(Log::Open(LogOptions(), tablet()->tablet_id(),
+                        tablet()->metadata()->wal_dir(), tablet()->metadata()->fs_manager()->uuid(),
+                        *tablet()->schema(), tablet()->metadata()->schema_version(),
+                        metric_entity_.get(), append_pool_.get(), &log));
 
-    tablet_peer_->SetBootstrapping();
+    ASSERT_OK(tablet_peer_->SetBootstrapping());
     ASSERT_OK(tablet_peer_->InitTabletPeer(tablet(),
-                                           std::shared_future<client::YBClientPtr>(),
-                                           clock(),
-                                           messenger_,
+                                           std::shared_future<client::YBClient*>(),
+                                           nullptr /* server_mem_tracker */,
+                                           messenger_.get(),
                                            proxy_cache_.get(),
                                            log,
                                            metric_entity_,
                                            raft_pool_.get(),
                                            tablet_prepare_pool_.get(),
-                                           nullptr /* service_thread_pool */));
+                                           nullptr /* retryable_requests */));
   }
 
   Status StartPeer(const ConsensusBootstrapInfo& info) {
     RETURN_NOT_OK(tablet_peer_->Start(info));
 
-    RETURN_NOT_OK(tablet_peer_->consensus()->EmulateElection());
-
+    AssertLoggedWaitFor([&]() -> Result<bool> {
+      if (FLAGS_quick_leader_election_on_create) {
+        return tablet_peer_->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
+      }
+      RETURN_NOT_OK(tablet_peer_->consensus()->EmulateElection());
+      return true;
+    }, MonoDelta::FromMilliseconds(500), "If quick leader elections enabled, wait for peer to be a "
+                                         "leader, otherwise emulate.");
     return Status::OK();
   }
 
@@ -189,6 +201,7 @@ class TabletPeerTest : public YBTabletTest,
   }
 
   void TearDown() override {
+    messenger_->Shutdown();
     tablet_peer_->Shutdown();
     YBTabletTest::TearDown();
   }
@@ -217,19 +230,16 @@ class TabletPeerTest : public YBTabletTest,
     operation_state->set_completion_callback(
         std::make_unique<LatchWriteCallback>(&rpc_latch, resp.get()));
 
-    tablet_peer->WriteAsync(std::move(operation_state), MonoTime::Max() /* deadline */);
+    tablet_peer->WriteAsync(std::move(operation_state), 1, CoarseTimePoint::max() /* deadline */);
     rpc_latch.Wait();
     CHECK(!resp->has_error())
         << "\nReq:\n" << req.DebugString() << "Resp:\n" << resp->DebugString();
 
-    // Roll the log after each write.
-    // Usually the append thread does the roll and no additional sync is required. However in
-    // this test the thread that is appending is not the same thread that is rolling the log
-    // so we must make sure the Log's queue is flushed before we roll or we might have a race
-    // between the appender thread and the thread executing the test.
-    CHECK_OK(tablet_peer->log_->WaitUntilAllFlushed());
-    CHECK_OK(tablet_peer->log_->AllocateSegmentAndRollOver());
-    return Status::OK();
+    Synchronizer synchronizer;
+    CHECK_OK(tablet_peer->log_->TEST_SubmitFuncToAppendToken([&synchronizer, tablet_peer] {
+      synchronizer.StatusCB(tablet_peer->log_->AllocateSegmentAndRollOver());
+    }));
+    return synchronizer.Wait();
   }
 
   // Execute insert requests and roll log after each one.
@@ -277,7 +287,7 @@ class TabletPeerTest : public YBTabletTest,
   int32_t delete_counter_;
   MetricRegistry metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
-  shared_ptr<Messenger> messenger_;
+  std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   std::unique_ptr<ThreadPool> raft_pool_;
   std::unique_ptr<ThreadPool> tablet_prepare_pool_;
@@ -292,17 +302,18 @@ class DelayedApplyOperation : public WriteOperation {
   DelayedApplyOperation(CountDownLatch* apply_started,
                         CountDownLatch* apply_continue,
                         std::unique_ptr<WriteOperationState> state)
-      : WriteOperation(std::move(state), consensus::LEADER, MonoTime::Max(), nullptr),
+      : WriteOperation(std::move(state), consensus::LEADER, CoarseTimePoint::max() /* deadline */,
+                       nullptr /* context */),
         apply_started_(DCHECK_NOTNULL(apply_started)),
         apply_continue_(DCHECK_NOTNULL(apply_continue)) {
   }
 
-  Status Apply() override {
+  Status Apply(int64_t leader_term) override {
     apply_started_->CountDown();
     LOG(INFO) << "Delaying apply...";
     apply_continue_->Wait();
     LOG(INFO) << "Apply proceeding";
-    return WriteOperation::Apply();
+    return WriteOperation::Apply(leader_term);
   }
 
  private:

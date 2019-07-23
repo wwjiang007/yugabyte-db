@@ -325,7 +325,7 @@ Status MemTableList::InstallMemtableFlushResults(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     const autovector<MemTable*>& mems, VersionSet* vset, InstrumentedMutex* mu,
     uint64_t file_number, autovector<MemTable*>* to_delete,
-    Directory* db_directory, LogBuffer* log_buffer) {
+    Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
   mu->AssertHeld();
@@ -340,16 +340,17 @@ Status MemTableList::InstallMemtableFlushResults(
     auto temp_range = mems[i]->Frontiers();
     if (temp_range) {
       if (frontiers) {
-        frontiers->Merge(*temp_range);
+        frontiers->MergeFrontiers(*temp_range);
       } else {
         frontiers = temp_range->Clone();
       }
     }
+    mems[i]->file_number_holder_ = file_number_holder;
     mems[i]->file_number_ = file_number;
   }
   if (frontiers) {
     DCHECK_NE(0, mems[0]->edit_.GetNewFiles().size());
-    mems[0]->edit_.SetFlushedFrontier(frontiers->Largest().Clone());
+    mems[0]->edit_.UpdateFlushedFrontier(frontiers->Largest().Clone());
   }
 
   // if some other thread is already committing, then return
@@ -361,8 +362,8 @@ Status MemTableList::InstallMemtableFlushResults(
   // Only a single thread can be executing this piece of code
   commit_in_progress_ = true;
 
-  // scan all memtables from the earliest, and commit those
-  // (in that order) that have finished flushing. Memetables
+  // Scan all memtables from the earliest, and commit those
+  // (in that order) that have finished flushing. Memtables
   // are always committed in the order that they were created.
   while (!current_->memlist_.empty() && s.ok()) {
     MemTable* m = current_->memlist_.back();  // get the last element
@@ -400,6 +401,7 @@ Status MemTableList::InstallMemtableFlushResults(
         m->edit_.Clear();
         num_flush_not_started_++;
         m->file_number_ = 0;
+        m->file_number_holder_.Reset();
         imm_flush_needed.store(true, std::memory_order_release);
       }
       ++mem_id;

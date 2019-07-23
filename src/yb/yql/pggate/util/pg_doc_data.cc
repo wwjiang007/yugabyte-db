@@ -17,6 +17,8 @@
 
 #include "yb/client/client.h"
 
+#include "yb/util/decimal.h"
+
 namespace yb {
 namespace pggate {
 
@@ -59,6 +61,12 @@ Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
   switch (col_value.type()) {
     case InternalType::VALUE_NOT_SET:
       break;
+    case InternalType::kBoolValue:
+      WriteBool(col_value.bool_value(), buffer);
+      break;
+    case InternalType::kInt8Value:
+      WriteInt8(col_value.int8_value(), buffer);
+      break;
     case InternalType::kInt16Value:
       WriteInt16(col_value.int16_value(), buffer);
       break;
@@ -67,6 +75,9 @@ Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
       break;
     case InternalType::kInt64Value:
       WriteInt64(col_value.int64_value(), buffer);
+      break;
+    case InternalType::kUint32Value:
+      WriteUint32(col_value.uint32_value(), buffer);
       break;
     case InternalType::kFloatValue:
       WriteFloat(col_value.float_value(), buffer);
@@ -77,26 +88,32 @@ Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
     case InternalType::kStringValue:
       WriteText(col_value.string_value(), buffer);
       break;
-
-    case InternalType::kBoolValue:
     case InternalType::kBinaryValue:
-    case InternalType::kTimestampValue:
+      WriteBinary(col_value.binary_value(), buffer);
+      break;
     case InternalType::kDecimalValue:
+      // Passing a serialized form of YB Decimal, decoding will be done in pg_expr.cc
+      WriteText(col_value.decimal_value(), buffer);
+      break;
+    case InternalType::kTimestampValue:
+    case InternalType::kDateValue: // Not used for PG storage
+    case InternalType::kTimeValue: // Not used for PG storage
     case InternalType::kVarintValue:
     case InternalType::kInetaddressValue:
     case InternalType::kJsonbValue:
     case InternalType::kUuidValue:
     case InternalType::kTimeuuidValue:
       // PgGate has not supported these datatypes yet.
-      return STATUS(NotSupported, "Unexpected data was read from database");
+      return STATUS_FORMAT(NotSupported,
+          "Unexpected data was read from database: col_value.type()=$0", col_value.type());
 
-    case InternalType::kInt8Value:
     case InternalType::kListValue:
     case InternalType::kMapValue:
     case InternalType::kSetValue:
     case InternalType::kFrozenValue:
       // Postgres does not have these datatypes.
-      return STATUS(Corruption, "Unexpected data was read from database");
+      return STATUS_FORMAT(Corruption,
+          "Unexpected data was read from database: col_value.type()=$0", col_value.type());
   }
 
   return Status::OK();
@@ -106,7 +123,7 @@ Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
 // Read Tuple Routine in DocDB Format (wire_protocol).
 //--------------------------------------------------------------------------------------------------
 
-CHECKED_STATUS PgDocData::LoadCache(const string& cache, int64_t *total_row_count, Slice *cursor) {
+Status PgDocData::LoadCache(const string& cache, int64_t *total_row_count, Slice *cursor) {
   // Setup the buffer to read the next set of tuples.
   CHECK(cursor->empty()) << "Existing cache is not yet fully read";
   *cursor = cache;
@@ -114,7 +131,7 @@ CHECKED_STATUS PgDocData::LoadCache(const string& cache, int64_t *total_row_coun
   // Read the number row_count in this set.
   int64_t this_count;
   size_t read_size = ReadNumber(cursor, &this_count);
-  *total_row_count += this_count;
+  *total_row_count = this_count;
   cursor->remove_prefix(read_size);
 
   return Status::OK();

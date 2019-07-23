@@ -118,7 +118,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   MonitoredTaskState AbortAndReturnPrevState() override;
 
   MonitoredTaskState state() const override {
-    return state_.load();
+    return state_.load(std::memory_order_acquire);
   }
 
   MonoTime start_timestamp() const override { return start_ts_; }
@@ -171,6 +171,9 @@ class RetryingTSRpcTask : public MonitoredTask {
   // pool, rather than a reactor thread, so it may do blocking IO operations.
   void DoRpcCallback();
 
+  // Called when the async task unregisters either successfully or unsuccessfully.
+  virtual void UnregisterAsyncTaskCallback();
+
   Master* const master_;
   ThreadPool* const callback_pool_;
   const gscoped_ptr<TSPicker> replica_picker_;
@@ -187,7 +190,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
 
-  std::atomic<int64_t> reactor_task_id_;
+  std::atomic<rpc::ScheduledTaskId> reactor_task_id_{rpc::kInvalidTaskId};
 
  private:
   // Returns true if we should impose a limit in the number of retries for this task type.
@@ -294,6 +297,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
+  void UnregisterAsyncTaskCallback() override;
 
   const TabletId tablet_id_;
   const tablet::TabletDataState delete_type_;
@@ -331,7 +335,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
 
   uint32_t schema_version_;
   scoped_refptr<TabletInfo> tablet_;
-  tserver::AlterSchemaResponsePB resp_;
+  tserver::ChangeMetadataResponsePB resp_;
 };
 
 class AsyncCopartitionTable : public RetryingTSRpcTask {

@@ -28,51 +28,6 @@ namespace yb {
 namespace ql {
 
 //--------------------------------------------------------------------------------------------------
-// This class represents VALUES clause
-class PTValues : public PTCollection {
- public:
-  //------------------------------------------------------------------------------------------------
-  // Public types.
-  typedef MCSharedPtr<PTValues> SharedPtr;
-  typedef MCSharedPtr<const PTValues> SharedPtrConst;
-
-  //------------------------------------------------------------------------------------------------
-  // Constructor and destructor.
-  PTValues(MemoryContext *memctx,
-           YBLocation::SharedPtr loc,
-           PTExprListNode::SharedPtr tuple);
-  virtual ~PTValues();
-
-  template<typename... TypeArgs>
-  inline static PTValues::SharedPtr MakeShared(MemoryContext *memctx,
-                                               TypeArgs&&... args) {
-    return MCMakeShared<PTValues>(memctx, std::forward<TypeArgs>(args)...);
-  }
-
-  // Add a tree node at the end.
-  void Append(const PTExprListNode::SharedPtr& tnode);
-  void Prepend(const PTExprListNode::SharedPtr& tnode);
-
-  // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
-  void PrintSemanticAnalysisResult(SemContext *sem_context);
-
-  // Access function for tuples_.
-  const TreeListNode<PTExprListNode>& tuples() {
-    return tuples_;
-  }
-
-  // Number of provided tuples.
-  virtual int TupleCount() const {
-    return tuples_.size();
-  }
-  PTExprListNode::SharedPtr Tuple(int index) const;
-
- private:
-  TreeListNode<PTExprListNode> tuples_;
-};
-
-//--------------------------------------------------------------------------------------------------
 // ORDER BY.
 class PTOrderBy : public TreeNode {
  public:
@@ -93,6 +48,11 @@ class PTOrderBy : public TreeNode {
             const Direction direction,
             const NullPlacement null_placement);
   virtual ~PTOrderBy();
+
+  // Node type.
+  virtual TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTOrderBy;
+  }
 
   template<typename... TypeArgs>
   inline static PTOrderBy::SharedPtr MakeShared(MemoryContext *memctx, TypeArgs&&... args) {
@@ -138,6 +98,11 @@ class PTTableRef : public TreeNode {
              MCSharedPtr<MCString> alias);
   virtual ~PTTableRef();
 
+  // Node type.
+  virtual TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTTableRef;
+  }
+
   template<typename... TypeArgs>
   inline static PTTableRef::SharedPtr MakeShared(MemoryContext *memctx, TypeArgs&&... args) {
     return MCMakeShared<PTTableRef>(memctx, std::forward<TypeArgs>(args)...);
@@ -178,6 +143,12 @@ class PTSelectStmt : public PTDmlStmt {
                PTOrderByListNode::SharedPtr order_by_clause,
                PTExpr::SharedPtr limit_clause,
                PTExpr::SharedPtr offset_clause);
+  // Construct a nested select tnode to select from the index.
+  PTSelectStmt(MemoryContext *memctx,
+               const PTSelectStmt& parent,
+               PTExprListNode::SharedPtr selected_exprs,
+               const TableId& index_id,
+               bool covers_fully);
   virtual ~PTSelectStmt();
 
   template<typename... TypeArgs>
@@ -189,6 +160,7 @@ class PTSelectStmt : public PTDmlStmt {
   // Node semantics analysis.
   virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
+  ExplainPlanPB AnalysisResultToPB() override;
 
   // Execution opcode.
   virtual TreeNodeOpcode opcode() const override {
@@ -246,12 +218,40 @@ class PTSelectStmt : public PTDmlStmt {
     return is_aggregate_;
   }
 
+  const PTSelectStmt::SharedPtr& child_select() const {
+    return child_select_;
+  }
+
   const TableId& index_id() const {
     return index_id_;
   }
 
   bool covers_fully() const {
     return covers_fully_;
+  }
+
+  // Certain tables can be read by any authorized role specifically because they are being used
+  // by the Cassandra driver:
+  // system_schema.keyspaces
+  // system_schema.columns
+  // system_schema.tables
+  // system.local
+  // system.peers
+  bool IsReadableByAllSystemTable() const;
+
+  const std::shared_ptr<client::YBTable>& bind_table() const override {
+    return child_select_ ? child_select_->bind_table() : PTDmlStmt::bind_table();
+  }
+
+  const MCVector<PTBindVar*> &bind_variables() const override {
+    return child_select_ ? child_select_->bind_variables() : PTDmlStmt::bind_variables();
+  }
+  MCVector<PTBindVar*> &bind_variables() override {
+    return child_select_ ? child_select_->bind_variables() : PTDmlStmt::bind_variables();
+  }
+
+  std::vector<int64_t> hash_col_indices() const override {
+    return child_select_ ? child_select_->hash_col_indices() : PTDmlStmt::hash_col_indices();
   }
 
  private:
@@ -289,7 +289,11 @@ class PTSelectStmt : public PTDmlStmt {
   bool is_forward_scan_ = true;
   bool is_aggregate_ = false;
 
-  // Index info.
+  // Child select statement. Currently only a select statement using an index (covered or uncovered)
+  // has a child select statement to query an index.
+  PTSelectStmt::SharedPtr child_select_;
+
+  // For nested select from an index: the index id and whether it covers the query fully.
   TableId index_id_;
   bool covers_fully_ = false;
 };

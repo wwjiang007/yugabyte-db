@@ -66,6 +66,8 @@ DECLARE_string(callhome_tag);
 DECLARE_string(callhome_url);
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(simulate_slow_table_create_secs);
+DECLARE_bool(return_error_if_namespace_not_found);
 
 #define NAMESPACE_ENTRY(namespace) \
     std::make_tuple(k##namespace##NamespaceName, k##namespace##NamespaceId)
@@ -84,27 +86,32 @@ DECLARE_double(leader_failure_max_missed_heartbeat_periods);
     EXPECTED_SYSTEM_NAMESPACES \
     /**/
 
-#define TABLE_ENTRY(namespace, table) \
+#define TABLE_ENTRY(namespace, table, relation_type) \
     std::make_tuple(k##namespace##table##TableName, \
-        k##namespace##NamespaceName, k##namespace##NamespaceId)
+        k##namespace##NamespaceName, k##namespace##NamespaceId, relation_type)
+
+#define SYSTEM_TABLE_ENTRY(namespace, table) \
+    TABLE_ENTRY(namespace, table, SYSTEM_TABLE_RELATION)
 
 #define EXPECTED_SYSTEM_TABLES \
-    TABLE_ENTRY(System, Peers), \
-    TABLE_ENTRY(System, Local), \
-    TABLE_ENTRY(System, Partitions), \
-    TABLE_ENTRY(System, SizeEstimates), \
-    TABLE_ENTRY(SystemSchema, Aggregates), \
-    TABLE_ENTRY(SystemSchema, Columns), \
-    TABLE_ENTRY(SystemSchema, Functions), \
-    TABLE_ENTRY(SystemSchema, Indexes), \
-    TABLE_ENTRY(SystemSchema, Triggers), \
-    TABLE_ENTRY(SystemSchema, Types), \
-    TABLE_ENTRY(SystemSchema, Views), \
-    TABLE_ENTRY(SystemSchema, Keyspaces), \
-    TABLE_ENTRY(SystemSchema, Tables), \
-    TABLE_ENTRY(SystemAuth, Roles), \
-    TABLE_ENTRY(SystemAuth, RolePermissions), \
-    TABLE_ENTRY(SystemAuth, ResourceRolePermissionsIndex)
+    SYSTEM_TABLE_ENTRY(System, Peers), \
+    SYSTEM_TABLE_ENTRY(System, Local), \
+    SYSTEM_TABLE_ENTRY(System, Partitions), \
+    SYSTEM_TABLE_ENTRY(System, SizeEstimates), \
+    std::make_tuple(kSysCatalogTableName, kSystemSchemaNamespaceName, kSystemSchemaNamespaceId, \
+        SYSTEM_TABLE_RELATION), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Aggregates), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Columns), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Functions), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Indexes), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Triggers), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Types), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Views), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Keyspaces), \
+    SYSTEM_TABLE_ENTRY(SystemSchema, Tables), \
+    SYSTEM_TABLE_ENTRY(SystemAuth, Roles), \
+    SYSTEM_TABLE_ENTRY(SystemAuth, RolePermissions), \
+    SYSTEM_TABLE_ENTRY(SystemAuth, ResourceRolePermissionsIndex)
     /**/
 
 namespace yb {
@@ -138,7 +145,7 @@ class MasterTest : public YBTest {
 
     // Create a client proxy to it.
     client_messenger_ = ASSERT_RESULT(MessengerBuilder("Client").Build());
-    rpc::ProxyCache proxy_cache(client_messenger_);
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
     proxy_.reset(new MasterServiceProxy(&proxy_cache, mini_master_->bound_rpc_addr()));
 
     // Create the default test namespace.
@@ -148,6 +155,7 @@ class MasterTest : public YBTest {
   }
 
   void TearDown() override {
+    client_messenger_->Shutdown();
     mini_master_->Shutdown();
     YBTest::TearDown();
   }
@@ -182,7 +190,13 @@ class MasterTest : public YBTest {
   }
 
   void DoListAllNamespaces(ListNamespacesResponsePB* resp);
+  void DoListAllNamespaces(const boost::optional<YQLDatabase>& database_type,
+                           ListNamespacesResponsePB* resp);
+
   Status CreateNamespace(const NamespaceName& ns_name, CreateNamespaceResponsePB* resp);
+  Status CreateNamespace(const NamespaceName& ns_name,
+                         const boost::optional<YQLDatabase>& database_type,
+                         CreateNamespaceResponsePB* resp);
 
   RpcController* ResetAndGetController() {
     controller_->Reset();
@@ -202,12 +216,14 @@ class MasterTest : public YBTest {
     ASSERT_EQ(namespaces.namespaces_size(), namespace_info.size());
   }
 
-  void CheckTables(const std::set<std::tuple<TableName, NamespaceName, NamespaceId>>& table_info,
-                   const ListTablesResponsePB& tables) {
+  void CheckTables(
+      const std::set<std::tuple<TableName, NamespaceName, NamespaceId, bool>>& table_info,
+      const ListTablesResponsePB& tables) {
     for (int i = 0; i < tables.tables_size(); i++) {
       auto search_key = std::make_tuple(tables.tables(i).name(),
                                         tables.tables(i).namespace_().name(),
-                                        tables.tables(i).namespace_().id());
+                                        tables.tables(i).namespace_().id(),
+                                        tables.tables(i).relation_type());
       ASSERT_TRUE(table_info.find(search_key) != table_info.end())
           << strings::Substitute("Couldn't find table $0.$1",
               tables.tables(i).namespace_().name(), tables.tables(i).name());
@@ -226,7 +242,7 @@ class MasterTest : public YBTest {
     LOG(INFO) << "Update cluster config to: " << cluster_config->ShortDebugString();
   }
 
-  shared_ptr<Messenger> client_messenger_;
+  std::unique_ptr<Messenger> client_messenger_;
   gscoped_ptr<MiniMaster> mini_master_;
   gscoped_ptr<MasterServiceProxy> proxy_;
   shared_ptr<RpcController> controller_;
@@ -237,7 +253,7 @@ TEST_F(MasterTest, TestPingServer) {
   server::PingRequestPB req;
   server::PingResponsePB resp;
 
-  rpc::ProxyCache proxy_cache(client_messenger_);
+  rpc::ProxyCache proxy_cache(client_messenger_.get());
   server::GenericServiceProxy generic_proxy(&proxy_cache, mini_master_->bound_rpc_addr());
   ASSERT_OK(generic_proxy.Ping(req, &resp, ResetAndGetController()));
 }
@@ -283,14 +299,13 @@ TEST_F(MasterTest, TestCallHome) {
   FLAGS_callhome_tag = tag_value;
   FLAGS_callhome_url = Substitute("http://$0/callhome", ToString(addr));
 
-  std::unordered_map<string, vector<string>> collection_levels;
-  collection_levels["low"] = {"cluster_uuid", "node_uuid", "server_type", "version_info",
-                              "timestamp", "tables", "masters", "tservers", "tablets", "gflags"};
-  auto& medium = collection_levels["medium"];
-  medium = collection_levels["low"];
-  medium.push_back("metrics");
-  medium.push_back("rpcs");
-  collection_levels["high"] = medium;
+  set<string> low {"cluster_uuid", "node_uuid", "server_type", "version_info",
+                   "timestamp", "tables", "masters",  "tservers", "tablets", "gflags"};
+  std::unordered_map<string, set<string>> collection_levels;
+  collection_levels["low"] = low;
+  collection_levels["medium"] = low;
+  collection_levels["medium"].insert({"metrics", "rpcs", "hostname", "current_user"});
+  collection_levels["high"] = collection_levels["medium"];
 
   for (const auto& collection_level : collection_levels) {
     LOG(INFO) << "Collection level: " << collection_level.first;
@@ -311,7 +326,20 @@ TEST_F(MasterTest, TestCallHome) {
     ASSERT_OK(reader.ExtractString(reader.root(), "tag", &received_tag));
     ASSERT_EQ(received_tag, tag_value);
 
+    if (collection_level.second.find("hostname") != collection_level.second.end()) {
+      string received_hostname;
+      ASSERT_OK(reader.ExtractString(reader.root(), "hostname", &received_hostname));
+      ASSERT_EQ(received_hostname, mini_master_->master()->get_hostname());
+    }
+
+    if (collection_level.second.find("current_user") != collection_level.second.end()) {
+      string received_user;
+      ASSERT_OK(reader.ExtractString(reader.root(), "current_user", &received_user));
+      ASSERT_EQ(received_user, mini_master_->master()->get_current_user());
+    }
+
     auto count = reader.root()->MemberEnd() - reader.root()->MemberBegin();
+    LOG(INFO) << "Number of elements for level " << collection_level.first << ": " << count;
     // The number of fields should be equal to the number of collectors plus one for the tag field.
     ASSERT_EQ(count, collection_level.second.size() + 1);
 
@@ -365,8 +393,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   descs.clear();
   mini_master_->master()->ts_manager()->GetAllDescriptors(&descs);
   ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
-  TSRegistrationPB reg;
-  descs[0]->GetRegistration(&reg);
+  TSRegistrationPB reg = descs[0]->GetRegistration();
   ASSERT_EQ(fake_reg.DebugString(), reg.DebugString()) << "Master got different registration";
 
   ASSERT_TRUE(mini_master_->master()->ts_manager()->LookupTSByUUID(kTsUUID, &ts_desc));
@@ -433,11 +460,12 @@ Status MasterTest::DoCreateTable(const NamespaceName& namespace_name,
   CreateTableResponsePB resp;
 
   request->set_name(table_name);
-  RETURN_NOT_OK(SchemaToPB(schema, request->mutable_schema()));
+  SchemaToPB(schema, request->mutable_schema());
 
   if (!namespace_name.empty()) {
     request->mutable_namespace_()->set_name(namespace_name);
   }
+  request->mutable_partition_schema()->set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
   request->set_num_tablets(8);
 
   // Dereferencing as the RPCs require const ref for request. Keeping request param as pointer
@@ -489,6 +517,68 @@ Status MasterTest::DeleteTable(const NamespaceName& namespace_name,
   return Status::OK();
 }
 
+TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
+  FLAGS_simulate_slow_table_create_secs = 10;
+
+  const char *kNamespaceName = "testnamespace";
+  CreateNamespaceResponsePB resp;
+  ASSERT_OK(CreateNamespace(kNamespaceName, YQLDatabase::YQL_DATABASE_CQL, &resp));
+
+  auto task = [kNamespaceName, this]() {
+    const char *kTableName = "testtable";
+    const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+    shared_ptr<RpcController> controller;
+    // Set an RPC timeout for the controllers.
+    controller = make_shared<RpcController>();
+    controller->set_timeout(MonoDelta::FromSeconds(FLAGS_simulate_slow_table_create_secs * 2));
+
+    CreateTableRequestPB req;
+    CreateTableResponsePB resp;
+
+    req.set_name(kTableName);
+    SchemaToPB(kTableSchema, req.mutable_schema());
+    req.mutable_namespace_()->set_name(kNamespaceName);
+    req.mutable_partition_schema()->set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
+    req.set_num_tablets(8);
+    ASSERT_OK(this->proxy_->CreateTable(req, &resp, controller.get()));
+    ASSERT_FALSE(resp.has_error());
+    LOG(INFO) << "Done creating table";
+  };
+
+  std::thread t(task);
+
+  // Delete the namespace (by NAME).
+  {
+    // Give the CreateTable request some time to start and find the namespace.
+    SleepFor(MonoDelta::FromSeconds(FLAGS_simulate_slow_table_create_secs / 2));
+    DeleteNamespaceRequestPB req;
+    DeleteNamespaceResponsePB resp;
+    req.mutable_namespace_()->set_name(kNamespaceName);
+    ASSERT_OK(proxy_->DeleteNamespace(req, &resp, ResetAndGetController()));
+    SCOPED_TRACE(resp.DebugString());
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  t.join();
+
+  {
+    FLAGS_return_error_if_namespace_not_found = true;
+    ListTablesRequestPB req;
+    ListTablesResponsePB resp;
+    ASSERT_OK(proxy_->ListTables(req, &resp, ResetAndGetController()));
+    LOG(INFO) << "Finished first ListTables request";
+    ASSERT_TRUE(resp.has_error());
+    string msg = resp.error().status().message();
+    ASSERT_TRUE(msg.find("Keyspace identifier not found") != string::npos);
+
+    // After turning off this flag, ListTables should skip the table with the error.
+    FLAGS_return_error_if_namespace_not_found = false;
+    ASSERT_OK(proxy_->ListTables(req, &resp, ResetAndGetController()));
+    LOG(INFO) << "Finished second ListTables request";
+    ASSERT_FALSE(resp.has_error());
+  }
+}
+
 TEST_F(MasterTest, TestCatalog) {
   const char *kTableName = "testtb";
   const char *kOtherTableName = "tbtest";
@@ -501,10 +591,11 @@ TEST_F(MasterTest, TestCatalog) {
 
   ListTablesResponsePB tables;
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -535,7 +626,7 @@ TEST_F(MasterTest, TestCatalog) {
 
   // List tables, should show only system table
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -549,10 +640,11 @@ TEST_F(MasterTest, TestCatalog) {
   ASSERT_OK(mini_master_->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -603,17 +695,34 @@ TEST_F(MasterTest, TestCatalog) {
     ASSERT_EQ(1, tables.tables_size());
     ASSERT_EQ(kSystemPeersTableName, tables.tables(0).name());
   }
-}
-
-TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
-  const char *kTableName = "testtb";
 
   {
-    const Schema kTableSchema({ ColumnSchema("key", BOOL) }, 1);
-    Status s = CreateTable(kTableName, kTableSchema);
-    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(),
-        "Invalid datatype for primary key column");
+    ListTablesRequestPB req;
+    req.add_relation_type_filter(USER_TABLE_RELATION);
+    DoListTables(req, &tables);
+    ASSERT_EQ(2, tables.tables_size());
+  }
+
+  {
+    ListTablesRequestPB req;
+    req.add_relation_type_filter(INDEX_TABLE_RELATION);
+    DoListTables(req, &tables);
+    ASSERT_EQ(0, tables.tables_size());
+  }
+
+  {
+    ListTablesRequestPB req;
+    req.add_relation_type_filter(SYSTEM_TABLE_RELATION);
+    DoListTables(req, &tables);
+    ASSERT_EQ(kNumSystemTables, tables.tables_size());
+  }
+
+  {
+    ListTablesRequestPB req;
+    req.add_relation_type_filter(SYSTEM_TABLE_RELATION);
+    req.add_relation_type_filter(USER_TABLE_RELATION);
+    DoListTables(req, &tables);
+    ASSERT_EQ(kNumSystemTables + 2, tables.tables_size());
   }
 }
 
@@ -635,8 +744,8 @@ TEST_F(MasterTest, TestCreateTableInvalidSchema) {
   ASSERT_OK(proxy_->CreateTable(req, &resp, ResetAndGetController()));
   SCOPED_TRACE(resp.DebugString());
   ASSERT_TRUE(resp.has_error());
-  ASSERT_EQ("code: INVALID_ARGUMENT message: \"Duplicate column name: col\"",
-            resp.error().status().ShortDebugString());
+  ASSERT_EQ(AppStatusPB::INVALID_ARGUMENT, resp.error().status().code());
+  ASSERT_EQ("Duplicate column name: col", resp.error().status().message());
 }
 
 // Regression test for KUDU-253/KUDU-592: crash if the GetTableLocations RPC call is
@@ -655,9 +764,9 @@ TEST_F(MasterTest, TestInvalidGetTableLocations) {
     ASSERT_OK(proxy_->GetTableLocations(req, &resp, ResetAndGetController()));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_TRUE(resp.has_error());
-    ASSERT_EQ("code: INVALID_ARGUMENT message: "
-              "\"start partition key is greater than the end partition key\"",
-              resp.error().status().ShortDebugString());
+    ASSERT_EQ(AppStatusPB::INVALID_ARGUMENT, resp.error().status().code());
+    ASSERT_EQ("start partition key is greater than the end partition key",
+              resp.error().status().message());
   }
 }
 
@@ -719,7 +828,15 @@ TEST_F(MasterTest, TestInvalidPlacementInfo) {
 }
 
 void MasterTest::DoListAllNamespaces(ListNamespacesResponsePB* resp) {
+  DoListAllNamespaces(boost::none, resp);
+}
+
+void MasterTest::DoListAllNamespaces(const boost::optional<YQLDatabase>& database_type,
+                                     ListNamespacesResponsePB* resp) {
   ListNamespacesRequestPB req;
+  if (database_type) {
+    req.set_database_type(*database_type);
+  }
 
   ASSERT_OK(proxy_->ListNamespaces(req, resp, ResetAndGetController()));
   SCOPED_TRACE(resp->DebugString());
@@ -727,8 +844,17 @@ void MasterTest::DoListAllNamespaces(ListNamespacesResponsePB* resp) {
 }
 
 Status MasterTest::CreateNamespace(const NamespaceName& ns_name, CreateNamespaceResponsePB* resp) {
+  return CreateNamespace(ns_name, boost::none, resp);
+}
+
+Status MasterTest::CreateNamespace(const NamespaceName& ns_name,
+                                   const boost::optional<YQLDatabase>& database_type,
+                                   CreateNamespaceResponsePB* resp) {
   CreateNamespaceRequestPB req;
   req.set_name(ns_name);
+  if (database_type) {
+    req.set_database_type(*database_type);
+  }
 
   RETURN_NOT_OK(proxy_->CreateNamespace(req, resp, ResetAndGetController()));
   if (resp->has_error()) {
@@ -776,7 +902,7 @@ TEST_F(MasterTest, TestNamespaces) {
     const Status s = CreateNamespace(other_ns_name, &resp);
     ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-        Substitute("Keyspace $0 already exists", other_ns_name));
+        Substitute("Keyspace '$0' already exists", other_ns_name));
   }
   {
     ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
@@ -850,7 +976,7 @@ TEST_F(MasterTest, TestNamespaces) {
     const Status s = CreateNamespace(default_namespace_name, &resp);
     ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-        Substitute("Keyspace $0 already exists", default_namespace_name));
+        Substitute("Keyspace '$0' already exists", default_namespace_name));
   }
   {
     ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
@@ -886,6 +1012,64 @@ TEST_F(MasterTest, TestNamespaces) {
   }
 }
 
+TEST_F(MasterTest, TestNamespaceSeparation) {
+  ListNamespacesResponsePB namespaces;
+
+  // Check default namespace.
+  {
+    ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+    // Including system namespace.
+    ASSERT_EQ(1 + kNumSystemNamespaces, namespaces.namespaces_size());
+    CheckNamespaces(
+        {
+            EXPECTED_DEFAULT_AND_SYSTEM_NAMESPACES
+        }, namespaces);
+  }
+
+  // Create a new namespace for each of YCQL, YSQL and YEDIS database types.
+  CreateNamespaceResponsePB resp;
+  ASSERT_OK(CreateNamespace("test_cql", YQLDatabase::YQL_DATABASE_CQL, &resp));
+  const NamespaceId cql_ns_id = resp.id();
+  ASSERT_OK(CreateNamespace("test_pgsql", YQLDatabase::YQL_DATABASE_PGSQL, &resp));
+  const NamespaceId pgsql_ns_id = resp.id();
+  ASSERT_OK(CreateNamespace("test_redis", YQLDatabase::YQL_DATABASE_REDIS, &resp));
+  const NamespaceId redis_ns_id = resp.id();
+
+  // List all namespaces and by each database type.
+  ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+  ASSERT_EQ(4 + kNumSystemNamespaces, namespaces.namespaces_size());
+  CheckNamespaces(
+      {
+        EXPECTED_DEFAULT_AND_SYSTEM_NAMESPACES,
+        std::make_tuple("test_cql", cql_ns_id),
+        std::make_tuple("test_pgsql", pgsql_ns_id),
+        std::make_tuple("test_redis", redis_ns_id),
+      }, namespaces);
+
+  ASSERT_NO_FATALS(DoListAllNamespaces(YQLDatabase::YQL_DATABASE_CQL, &namespaces));
+  ASSERT_EQ(2 + kNumSystemNamespaces, namespaces.namespaces_size());
+  CheckNamespaces(
+      {
+        // Defalt and system namespaces are created in YCQL.
+        EXPECTED_DEFAULT_AND_SYSTEM_NAMESPACES,
+        std::make_tuple("test_cql", cql_ns_id),
+      }, namespaces);
+
+  ASSERT_NO_FATALS(DoListAllNamespaces(YQLDatabase::YQL_DATABASE_PGSQL, &namespaces));
+  ASSERT_EQ(1, namespaces.namespaces_size());
+  CheckNamespaces(
+      {
+        std::make_tuple("test_pgsql", pgsql_ns_id),
+      }, namespaces);
+
+  ASSERT_NO_FATALS(DoListAllNamespaces(YQLDatabase::YQL_DATABASE_REDIS, &namespaces));
+  ASSERT_EQ(1, namespaces.namespaces_size());
+  CheckNamespaces(
+      {
+        std::make_tuple("test_redis", redis_ns_id),
+      }, namespaces);
+}
+
 TEST_F(MasterTest, TestDeletingNonEmptyNamespace) {
   ListNamespacesResponsePB namespaces;
 
@@ -916,10 +1100,10 @@ TEST_F(MasterTest, TestDeletingNonEmptyNamespace) {
 
   ListTablesResponsePB tables;
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -976,7 +1160,7 @@ TEST_F(MasterTest, TestDeletingNonEmptyNamespace) {
 
   // List tables, should show only system table.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1010,10 +1194,11 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
   ASSERT_OK(CreateTable(kTableName, kTableSchema));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1022,7 +1207,7 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
 
   // List tables, should show 1 table.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1032,10 +1217,11 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
   ASSERT_OK(CreateTable(default_namespace_name, kTableName, kTableSchema));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1044,7 +1230,7 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
 
   // List tables, should show 1 table.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1059,7 +1245,7 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
 
   // List tables, should show 1 table.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1089,10 +1275,10 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
   ASSERT_OK(CreateTable(other_ns_name, kTableName, kTableSchema));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1111,10 +1297,10 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
     ASSERT_STR_CONTAINS(resp.error().status().ShortDebugString(), "Keyspace name not found");
   }
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1133,10 +1319,10 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
     ASSERT_STR_CONTAINS(resp.error().status().ShortDebugString(), "Keyspace identifier not found");
   }
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1152,10 +1338,11 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
     ASSERT_FALSE(resp.has_error());
   }
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1164,7 +1351,7 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
 
   // List tables, should show 1 table.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1198,10 +1385,11 @@ TEST_F(MasterTest, TestFullTableName) {
   ASSERT_OK(CreateTable(default_namespace_name, kTableName, kTableSchema));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1229,11 +1417,12 @@ TEST_F(MasterTest, TestFullTableName) {
   ASSERT_OK(CreateTable(other_ns_name, kTableName, kTableSchema));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(2 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(2 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1243,14 +1432,15 @@ TEST_F(MasterTest, TestFullTableName) {
   ASSERT_EQ(1, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
       }, tables);
 
   ASSERT_NO_FATALS(DoListAllTables(&tables, other_ns_name));
   ASSERT_EQ(1, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id)
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION)
       }, tables);
 
   // Try to alter table: change namespace name into the default one.
@@ -1265,18 +1455,19 @@ TEST_F(MasterTest, TestFullTableName) {
     ASSERT_OK(proxy_->AlterTable(req, &resp, ResetAndGetController()));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_TRUE(resp.has_error());
-    ASSERT_EQ(resp.error().code(), MasterErrorPB::TABLE_ALREADY_PRESENT);
+    ASSERT_EQ(resp.error().code(), MasterErrorPB::OBJECT_ALREADY_PRESENT);
     ASSERT_EQ(resp.error().status().code(), AppStatusPB::ALREADY_PRESENT);
     ASSERT_STR_CONTAINS(resp.error().status().ShortDebugString(),
-        "Table already exists");
+        " already exists");
   }
   // Check that nothing's changed (still have 3 tables).
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(2 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(2 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1284,10 +1475,11 @@ TEST_F(MasterTest, TestFullTableName) {
   ASSERT_OK(DeleteTable(other_ns_name, kTableName));
 
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, default_namespace_name, default_namespace_id),
+          std::make_tuple(kTableName, default_namespace_name, default_namespace_id,
+              USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1300,10 +1492,10 @@ TEST_F(MasterTest, TestFullTableName) {
     ASSERT_OK(proxy_->DeleteTable(req, &resp, ResetAndGetController()));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_TRUE(resp.has_error());
-    ASSERT_EQ(resp.error().code(), MasterErrorPB::TABLE_NOT_FOUND);
+    ASSERT_EQ(resp.error().code(), MasterErrorPB::OBJECT_NOT_FOUND);
     ASSERT_EQ(resp.error().status().code(), AppStatusPB::NOT_FOUND);
     ASSERT_STR_CONTAINS(resp.error().status().ShortDebugString(),
-        "The table does not exist");
+        "The object does not exist");
   }
 
   // Delete the table.
@@ -1311,7 +1503,7 @@ TEST_F(MasterTest, TestFullTableName) {
 
   // List tables, should show only system tables.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1363,10 +1555,10 @@ TEST_F(MasterTest, TestGetTableSchema) {
 
   ListTablesResponsePB tables;
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(1 + mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(1 + kNumSystemTables, tables.tables_size());
   CheckTables(
       {
-          std::make_tuple(kTableName, other_ns_name, other_ns_id),
+          std::make_tuple(kTableName, other_ns_name, other_ns_id, USER_TABLE_RELATION),
           EXPECTED_SYSTEM_TABLES
       }, tables);
 
@@ -1426,7 +1618,7 @@ TEST_F(MasterTest, TestGetTableSchema) {
 
   // List tables, should show only system tables.
   ASSERT_NO_FATALS(DoListAllTables(&tables));
-  ASSERT_EQ(mini_master_->master()->NumSystemTables(), tables.tables_size());
+  ASSERT_EQ(kNumSystemTables, tables.tables_size());
   CheckTables(
       {
           EXPECTED_SYSTEM_TABLES
@@ -1449,6 +1641,16 @@ TEST_F(MasterTest, TestGetTableSchema) {
             EXPECTED_DEFAULT_AND_SYSTEM_NAMESPACES
         }, namespaces);
   }
+}
+
+TEST_F(MasterTest, TestFailedMasterRestart) {
+  TearDown();
+
+  mini_master_.reset(new MiniMaster(Env::Default(), GetTestPath("Master-test"),
+                                    AllocateFreePort(), AllocateFreePort(), 0));
+  ASSERT_NOK(mini_master_->Start(true));
+  // Restart master should succeed.
+  ASSERT_OK(mini_master_->Start());
 }
 
 } // namespace master

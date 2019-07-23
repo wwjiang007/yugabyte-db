@@ -75,6 +75,7 @@
 #include "yb/util/subprocess.h"
 #include "yb/util/test_util.h"
 #include "yb/util/size_literals.h"
+#include "yb/yql/pgwrapper/pg_wrapper.h"
 
 using namespace std::literals;  // NOLINT
 using namespace yb::size_literals;  // NOLINT
@@ -92,6 +93,8 @@ using strings::Substitute;
 
 using yb::master::GetLeaderMasterRpc;
 using yb::master::MasterServiceProxy;
+using yb::master::IsInitDbDoneRequestPB;
+using yb::master::IsInitDbDoneResponsePB;
 using yb::server::ServerStatusPB;
 using yb::tserver::ListTabletsRequestPB;
 using yb::tserver::ListTabletsResponsePB;
@@ -110,12 +113,19 @@ using yb::consensus::RunLeaderElectionRequestPB;
 using yb::consensus::RunLeaderElectionResponsePB;
 using yb::master::IsMasterLeaderReadyRequestPB;
 using yb::master::IsMasterLeaderReadyResponsePB;
+using yb::master::GetMasterClusterConfigRequestPB;
+using yb::master::GetMasterClusterConfigResponsePB;
+using yb::master::ChangeMasterClusterConfigRequestPB;
+using yb::master::ChangeMasterClusterConfigResponsePB;
+using yb::master::SysClusterConfigEntryPB;
+using yb::master::BlacklistPB;
 using yb::master::ListMastersRequestPB;
 using yb::master::ListMastersResponsePB;
 using yb::master::ListMasterRaftPeersRequestPB;
 using yb::master::ListMasterRaftPeersResponsePB;
 using yb::tserver::TabletServerErrorPB;
 using yb::rpc::RpcController;
+using yb::pgwrapper::PgWrapper;
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
 
@@ -124,6 +134,7 @@ DECLARE_int32(replication_factor);
 DECLARE_bool(mem_tracker_logging);
 DECLARE_bool(mem_tracker_log_stack_trace);
 DECLARE_string(minicluster_daemon_id);
+DECLARE_bool(use_libbacktrace);
 
 DEFINE_string(external_daemon_heap_profile_prefix, "",
               "If this is not empty, tcmalloc's HEAPPROFILE is set this, followed by a unique "
@@ -136,12 +147,16 @@ DEFINE_bool(external_daemon_safe_shutdown, false,
 DECLARE_int64(outbound_rpc_block_size);
 DECLARE_int64(outbound_rpc_memory_limit);
 
+DEFINE_int64(external_mini_cluster_max_log_bytes, 50_MB,
+             "Max total size of log bytes produced by all external mini-cluster daemons. "
+             "The test is shut down if this limit is exceeded.");
+
 namespace yb {
 
 static const char* const kMasterBinaryName = "yb-master";
 static const char* const kTabletServerBinaryName = "yb-tserver";
 static double kProcessStartTimeoutSeconds = 60.0;
-static double kTabletServerRegistrationTimeoutSeconds = 10.0;
+static MonoDelta kTabletServerRegistrationTimeout = 10s;
 
 static const int kHeapProfileSignal = SIGUSR1;
 
@@ -153,25 +168,88 @@ static bool kBindToUniqueLoopbackAddress = true;
 
 constexpr size_t kDefaultMemoryLimitHardBytes = NonTsanVsTsan(1_GB, 512_MB);
 
+namespace {
+
+void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>* args_dest) {
+  const char* extra_daemon_flags_env_var_value = getenv(env_var_name);
+  if (extra_daemon_flags_env_var_value) {
+    LOG(INFO) << "Setting extra daemon flags as specified by env var " << env_var_name << ": "
+              << extra_daemon_flags_env_var_value;
+    // TODO: this has an issue with handling quoted arguments with embedded spaces.
+    std::istringstream iss(extra_daemon_flags_env_var_value);
+    copy(std::istream_iterator<string>(iss),
+         std::istream_iterator<string>(),
+         std::back_inserter(*args_dest));
+  } else {
+    LOG(INFO) << "Env var " << env_var_name << " not specified, not setting extra flags from it";
+  }
+}
+
+}  // anonymous namespace
+
+// ------------------------------------------------------------------------------------------------
+// ExternalMiniClusterOptions
+// ------------------------------------------------------------------------------------------------
+
 ExternalMiniClusterOptions::ExternalMiniClusterOptions()
     : bind_to_unique_loopback_addresses(kBindToUniqueLoopbackAddress),
-      timeout_(MonoDelta::FromMilliseconds(1000 * 10)) {
-  if (bind_to_unique_loopback_addresses && sizeof(pid_t) > 2) {
-    LOG(WARNING) << "pid size is " << sizeof(pid_t)
-                 << ", setting bind_to_unique_loopback_addresses=false";
-    bind_to_unique_loopback_addresses = false;
-  }
+      timeout(MonoDelta::FromMilliseconds(1000 * 10)) {
 }
 
 ExternalMiniClusterOptions::~ExternalMiniClusterOptions() {
 }
 
+Status ExternalMiniClusterOptions::RemovePort(const uint16_t port) {
+  auto iter = std::find(master_rpc_ports.begin(), master_rpc_ports.end(), port);
+
+  if (iter == master_rpc_ports.end()) {
+    return STATUS(InvalidArgument, Substitute(
+        "Port to be removed '$0' not found in existing list of $1 masters.",
+        port, num_masters));
+  }
+
+  master_rpc_ports.erase(iter);
+  --num_masters;
+
+  return Status::OK();
+}
+
+Status ExternalMiniClusterOptions::AddPort(const uint16_t port) {
+  auto iter = std::find(master_rpc_ports.begin(), master_rpc_ports.end(), port);
+
+  if (iter != master_rpc_ports.end()) {
+    return STATUS(InvalidArgument, Substitute(
+        "Port to be added '$0' already found in the existing list of $1 masters.",
+        port, num_masters));
+  }
+
+  master_rpc_ports.push_back(port);
+  ++num_masters;
+
+  return Status::OK();
+}
+
+void ExternalMiniClusterOptions::AdjustMasterRpcPorts() {
+  if (master_rpc_ports.size() == 1 && master_rpc_ports[0] == 0) {
+    // Add missing master ports to avoid errors when we try to start the cluster.
+    while (master_rpc_ports.size() < num_masters) {
+      master_rpc_ports.push_back(0);
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------
+// ExternalMiniCluster
+// ------------------------------------------------------------------------------------------------
+
 ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
     : opts_(opts), add_new_master_at_(-1) {
+  opts_.AdjustMasterRpcPorts();
   // These "extra mini cluster options" are added in the end of the command line.
   const auto common_extra_flags = {
       "--enable_tracing"s,
-      Substitute("--memory_limit_hard_bytes=$0", kDefaultMemoryLimitHardBytes)
+      Substitute("--memory_limit_hard_bytes=$0", kDefaultMemoryLimitHardBytes),
+      (opts.log_to_file ? "--alsologtostderr"s : "--logtostderr"s)
   };
   for (auto* extra_flags : {&opts_.extra_master_flags, &opts_.extra_tserver_flags}) {
     // Common default extra flags are inserted in the beginning so that they can be overridden by
@@ -180,10 +258,15 @@ ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
                         common_extra_flags.begin(),
                         common_extra_flags.end());
   }
+  AddExtraFlagsFromEnvVar("YB_EXTRA_MASTER_FLAGS", &opts_.extra_master_flags);
+  AddExtraFlagsFromEnvVar("YB_EXTRA_TSERVER_FLAGS", &opts_.extra_tserver_flags);
 }
 
 ExternalMiniCluster::~ExternalMiniCluster() {
   Shutdown();
+  if (messenger_holder_) {
+    messenger_holder_->Shutdown();
+  }
 }
 
 Status ExternalMiniCluster::DeduceBinRoot(std::string* ret) {
@@ -219,7 +302,7 @@ Status ExternalMiniCluster::HandleOptions() {
   return Status::OK();
 }
 
-Status ExternalMiniCluster::Start() {
+Status ExternalMiniCluster::Start(rpc::Messenger* messenger) {
   CHECK(masters_.empty()) << "Masters are not empty (size: " << masters_.size()
       << "). Maybe you meant Restart()?";
   CHECK(tablet_servers_.empty()) << "Tablet servers are not empty (size: "
@@ -227,10 +310,16 @@ Status ExternalMiniCluster::Start() {
   RETURN_NOT_OK(HandleOptions());
   FLAGS_replication_factor = opts_.num_masters;
 
-  rpc::MessengerBuilder builder("minicluster-messenger");
-  builder.set_num_reactors(1);
-  RETURN_NOT_OK_PREPEND(builder.Build().MoveTo(&messenger_),
-                        "Failed to start Messenger for minicluster");
+  if (messenger == nullptr) {
+    rpc::MessengerBuilder builder("minicluster-messenger");
+    builder.set_num_reactors(1);
+    messenger_holder_ = VERIFY_RESULT_PREPEND(
+        builder.Build(), "Failed to start Messenger for minicluster");
+    messenger_ = messenger_holder_.get();
+  } else {
+    messenger_holder_ = nullptr;
+    messenger_ = messenger;
+  }
   proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_);
 
   Status s = Env::Default()->CreateDir(data_root_);
@@ -238,24 +327,35 @@ Status ExternalMiniCluster::Start() {
     RETURN_NOT_OK_PREPEND(s, "Could not create root dir " + data_root_);
   }
 
+  LOG(INFO) << "Starting cluster with option bind_to_unique_loopback_addresses="
+      << (opts_.bind_to_unique_loopback_addresses ? "true" : "false");
+
   LOG(INFO) << "Starting " << opts_.num_masters << " masters";
   RETURN_NOT_OK_PREPEND(StartMasters(), "Failed to start masters.");
   add_new_master_at_ = opts_.num_masters;
 
-  LOG(INFO) << "Starting " << opts_.num_tablet_servers << " tablet servers";
+  if (opts_.num_tablet_servers > 0) {
+    LOG(INFO) << "Starting " << opts_.num_tablet_servers << " tablet servers";
 
-  for (int i = 1; i <= opts_.num_tablet_servers; i++) {
-    RETURN_NOT_OK_PREPEND(AddTabletServer(),
-                          Substitute("Failed starting tablet server $0", i));
+    for (int i = 1; i <= opts_.num_tablet_servers; i++) {
+      RETURN_NOT_OK_PREPEND(
+          AddTabletServer(ExternalMiniClusterOptions::kDefaultStartCqlProxy,
+                          opts_.start_pgsql_proxy),
+          Substitute("Failed starting tablet server $0", i));
+    }
+    RETURN_NOT_OK(WaitForTabletServerCount(
+        opts_.num_tablet_servers, kTabletServerRegistrationTimeout));
+  } else {
+    LOG(INFO) << "No need to start tablet servers";
   }
-  RETURN_NOT_OK(WaitForTabletServerCount(
-                  opts_.num_tablet_servers,
-                  MonoDelta::FromSeconds(kTabletServerRegistrationTimeoutSeconds)));
 
+  running_ = true;
   return Status::OK();
 }
 
 void ExternalMiniCluster::Shutdown(NodeSelectionMode mode) {
+  // TODO: in the regular MiniCluster Shutdown is a no-op if running_ is false.
+  // Therefore, in case of an error during cluster startup behavior might be different.
   if (mode == ALL) {
     for (const scoped_refptr<ExternalMaster>& master : masters_) {
       if (master) {
@@ -267,6 +367,7 @@ void ExternalMiniCluster::Shutdown(NodeSelectionMode mode) {
   for (const scoped_refptr<ExternalTabletServer>& ts : tablet_servers_) {
     ts->Shutdown();
   }
+  running_ = false;
 }
 
 Status ExternalMiniCluster::Restart() {
@@ -285,10 +386,9 @@ Status ExternalMiniCluster::Restart() {
     }
   }
 
-  RETURN_NOT_OK(WaitForTabletServerCount(
-      tablet_servers_.size(),
-      MonoDelta::FromSeconds(kTabletServerRegistrationTimeoutSeconds)));
+  RETURN_NOT_OK(WaitForTabletServerCount(tablet_servers_.size(), kTabletServerRegistrationTimeout));
 
+  running_ = true;
   return Status::OK();
 }
 
@@ -347,7 +447,7 @@ Result<ExternalMaster *> ExternalMiniCluster::StartMasterWithPeers(const string&
   LOG(INFO) << "Using auto-assigned rpc_port " << rpc_port << "; http_port " << http_port
             << " to start a new external mini-cluster master with peers '" << peer_addrs << "'.";
 
-  string addr = Substitute("127.0.0.1:$0", rpc_port);
+  string addr = MasterAddressForPort(rpc_port);
   string exe = GetBinaryPath(kMasterBinaryName);
 
   ExternalMaster* master =
@@ -361,13 +461,17 @@ Result<ExternalMaster *> ExternalMiniCluster::StartMasterWithPeers(const string&
   return master;
 }
 
+std::string ExternalMiniCluster::MasterAddressForPort(uint16_t port) const {
+  return Format(opts_.use_even_ips ? "127.0.0.2:$0" : "127.0.0.1:$0", port);
+}
+
 void ExternalMiniCluster::StartShellMaster(ExternalMaster** new_master) {
   uint16_t rpc_port = AllocateFreePort();
   uint16_t http_port = AllocateFreePort();
   LOG(INFO) << "Using auto-assigned rpc_port " << rpc_port << "; http_port " << http_port
             << " to start a new external mini-cluster shell master.";
 
-  string addr = Substitute("127.0.0.1:$0", rpc_port);
+  string addr = MasterAddressForPort(rpc_port);
 
   string exe = GetBinaryPath(kMasterBinaryName);
 
@@ -390,36 +494,6 @@ void ExternalMiniCluster::StartShellMaster(ExternalMaster** new_master) {
 
   add_new_master_at_++;
   *new_master = master;
-}
-
-Status ExternalMiniClusterOptions::RemovePort(const uint16_t port) {
-  auto iter = std::find(master_rpc_ports.begin(), master_rpc_ports.end(), port);
-
-  if (iter == master_rpc_ports.end()) {
-    return STATUS(InvalidArgument, Substitute(
-        "Port to be removed '$0' not found in existing list of $1 masters.",
-        port, num_masters));
-  }
-
-  master_rpc_ports.erase(iter);
-  --num_masters;
-
-  return Status::OK();
-}
-
-Status ExternalMiniClusterOptions::AddPort(const uint16_t port) {
-  auto iter = std::find(master_rpc_ports.begin(), master_rpc_ports.end(), port);
-
-  if (iter != master_rpc_ports.end()) {
-    return STATUS(InvalidArgument, Substitute(
-        "Port to be added '$0' already found in the existing list of $1 masters.",
-        port, num_masters));
-  }
-
-  master_rpc_ports.push_back(port);
-  ++num_masters;
-
-  return Status::OK();
 }
 
 Status ExternalMiniCluster::CheckPortAndMasterSizes() const {
@@ -490,7 +564,7 @@ Status ExternalMiniCluster::StepDownMasterLeader(TabletServerErrorPB::Code* erro
   lsd_req.set_dest_uuid(leader_uuid);
   LeaderStepDownResponsePB lsd_resp;
   RpcController lsd_rpc;
-  lsd_rpc.set_timeout(opts_.timeout_);
+  lsd_rpc.set_timeout(opts_.timeout);
   ConsensusServiceProxy proxy(proxy_cache_.get(), host_port);
   RETURN_NOT_OK(proxy.LeaderStepDown(lsd_req, &lsd_resp, &lsd_rpc));
   if (lsd_resp.has_error()) {
@@ -541,7 +615,7 @@ Status ExternalMiniCluster::ChangeConfig(ExternalMaster* master,
   ChangeConfigRequestPB req;
   ChangeConfigResponsePB resp;
   rpc::RpcController rpc;
-  rpc.set_timeout(opts_.timeout_);
+  rpc.set_timeout(opts_.timeout);
 
   RaftPeerPB peer_pb;
   peer_pb.set_permanent_uuid(use_hostport ? "" : master->uuid());
@@ -634,8 +708,51 @@ Status ExternalMiniCluster::PingMaster(ExternalMaster* master) const {
   std::shared_ptr<server::GenericServiceProxy> proxy =
       index == -1 ? master_generic_proxy(master->bound_rpc_addr()) : master_generic_proxy(index);
   rpc::RpcController rpc;
-  rpc.set_timeout(opts_.timeout_);
+  rpc.set_timeout(opts_.timeout);
   return proxy->Ping(req, &resp, &rpc);
+}
+
+Status ExternalMiniCluster::AddTServerToBlacklist(
+    ExternalMaster* master,
+    ExternalTabletServer* ts) {
+  GetMasterClusterConfigRequestPB config_req;
+  GetMasterClusterConfigResponsePB config_resp;
+  int index = GetIndexOfMaster(master);
+
+  if (index == -1) {
+    return STATUS(InvalidArgument, Substitute(
+        "Given master '$0' not in the current list of $1 masters.",
+        master->bound_rpc_hostport().ToString(), masters_.size()));
+  }
+
+  std::shared_ptr<MasterServiceProxy> proxy = master_proxy(index);
+  rpc::RpcController rpc;
+  rpc.set_timeout(opts_.timeout);
+  RETURN_NOT_OK(proxy->GetMasterClusterConfig(config_req, &config_resp, &rpc));
+  if (config_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "GetMasterClusterConfig RPC response hit error: $0",
+        config_resp.error().ShortDebugString()));
+  }
+  // Get current config
+  ChangeMasterClusterConfigRequestPB change_req;
+  SysClusterConfigEntryPB config = *config_resp.mutable_cluster_config();
+  // add tserver to blacklist
+  HostPortToPB(ts->bound_rpc_hostport(), config.mutable_server_blacklist()->mutable_hosts()->Add());
+  *change_req.mutable_cluster_config() = config;
+  ChangeMasterClusterConfigResponsePB change_resp;
+  rpc.Reset();
+  RETURN_NOT_OK(proxy->ChangeMasterClusterConfig(change_req, &change_resp, &rpc));
+  if (change_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "ChangeMasterClusterConfig RPC response hit error: $0",
+        change_resp.error().ShortDebugString()));
+  }
+
+  LOG(INFO) << "TServer at " << ts->bound_rpc_hostport().ToString()
+  << " was added to the blacklist";
+
+  return Status::OK();
 }
 
 Status ExternalMiniCluster::GetNumMastersAsSeenBy(ExternalMaster* master, int* num_peers) {
@@ -651,7 +768,7 @@ Status ExternalMiniCluster::GetNumMastersAsSeenBy(ExternalMaster* master, int* n
 
   std::shared_ptr<MasterServiceProxy> proxy = master_proxy(index);
   rpc::RpcController rpc;
-  rpc.set_timeout(opts_.timeout_);
+  rpc.set_timeout(opts_.timeout);
   RETURN_NOT_OK(proxy->ListMasters(list_req, &list_resp, &rpc));
   if (list_resp.has_error()) {
     return STATUS(RuntimeError, Substitute(
@@ -677,7 +794,7 @@ Status ExternalMiniCluster::WaitForLeaderCommitTermAdvance() {
 
   MonoTime now = MonoTime::Now();
   MonoTime deadline = now;
-  deadline.AddDelta(opts_.timeout_);
+  deadline.AddDelta(opts_.timeout);
   auto opid = start_opid;
 
   for (int i = 1; now.ComesBefore(deadline); ++i) {
@@ -720,11 +837,11 @@ Status ExternalMiniCluster::GetLastOpIdForEachMasterPeer(
 }
 
 Status ExternalMiniCluster::WaitForMastersToCommitUpTo(int target_index) {
-  auto deadline = CoarseMonoClock::Now() + opts_.timeout_.ToSteadyDuration();
+  auto deadline = CoarseMonoClock::Now() + opts_.timeout.ToSteadyDuration();
 
   for (int i = 1; CoarseMonoClock::Now() < deadline; i++) {
     vector<consensus::OpId> ids;
-    Status s = GetLastOpIdForEachMasterPeer(opts_.timeout_, consensus::COMMITTED_OPID, &ids);
+    Status s = GetLastOpIdForEachMasterPeer(opts_.timeout, consensus::COMMITTED_OPID, &ids);
 
     if (s.ok()) {
       bool any_behind = false;
@@ -748,7 +865,7 @@ Status ExternalMiniCluster::WaitForMastersToCommitUpTo(int target_index) {
   return STATUS_FORMAT(TimedOut,
                        "Index $0 not available on all replicas after $1. ",
                        target_index,
-                       opts_.timeout_);
+                       opts_.timeout);
 }
 
 Status ExternalMiniCluster::GetIsMasterLeaderServiceReady(ExternalMaster* master) {
@@ -764,7 +881,7 @@ Status ExternalMiniCluster::GetIsMasterLeaderServiceReady(ExternalMaster* master
 
   std::shared_ptr<MasterServiceProxy> proxy = master_proxy(index);
   rpc::RpcController rpc;
-  rpc.set_timeout(opts_.timeout_);
+  rpc.set_timeout(opts_.timeout);
   RETURN_NOT_OK(proxy->IsMasterLeaderServiceReady(req, &resp, &rpc));
   if (resp.has_error()) {
     return STATUS(RuntimeError, Substitute(
@@ -785,7 +902,7 @@ Status ExternalMiniCluster::GetLastOpIdForLeader(consensus::OpId* opid) {
       yb::master::kSysCatalogTabletId,
       leader->uuid(),
       consensus::COMMITTED_OPID,
-      opts_.timeout_,
+      opts_.timeout,
       opid));
 
   return Status::OK();
@@ -797,7 +914,7 @@ string ExternalMiniCluster::GetMasterAddresses() const {
     if (!peer_addrs.empty()) {
       peer_addrs += ",";
     }
-    peer_addrs += Substitute("127.0.0.1:$0", opts_.master_rpc_ports[i]);
+    peer_addrs += MasterAddressForPort(opts_.master_rpc_ports[i]);
   }
   return peer_addrs;
 }
@@ -820,12 +937,15 @@ Status ExternalMiniCluster::StartMasters() {
 
   vector<string> peer_addrs;
   for (int i = 0; i < num_masters; i++) {
-    string addr = Substitute("127.0.0.1:$0", opts_.master_rpc_ports[i]);
+    string addr = MasterAddressForPort(opts_.master_rpc_ports[i]);
     peer_addrs.push_back(addr);
   }
   string peer_addrs_str = JoinStrings(peer_addrs, ",");
   vector<string> flags = opts_.extra_master_flags;
   flags.push_back("--enable_leader_failure_detection=true");
+  if (opts_.start_pgsql_proxy) {
+    flags.push_back("--master_auto_run_initdb");
+  }
   string exe = GetBinaryPath(kMasterBinaryName);
 
   // Start the masters.
@@ -846,21 +966,66 @@ Status ExternalMiniCluster::StartMasters() {
     masters_.push_back(peer);
   }
 
+  if (opts_.start_pgsql_proxy) {
+    RETURN_NOT_OK(WaitForInitDb());
+  }
   return Status::OK();
 }
 
+Status ExternalMiniCluster::WaitForInitDb() {
+  const auto start_time = std::chrono::steady_clock::now();
+  const auto kTimeout = NonTsanVsTsan(600s, 1800s);
+  while (true) {
+    for (int i = 0; i < opts_.num_masters; i++) {
+      auto elapsed_time = std::chrono::steady_clock::now() - start_time;
+      if (elapsed_time > kTimeout) {
+        return STATUS_FORMAT(
+            TimedOut,
+            "Timed out while waiting for initdb to complete: elapsed time is $0, timeout is $1",
+            elapsed_time, kTimeout);
+      }
+      std::shared_ptr<MasterServiceProxy> proxy = master_proxy(i);
+      rpc::RpcController rpc;
+      rpc.set_timeout(opts_.timeout);
+      IsInitDbDoneRequestPB req;
+      IsInitDbDoneResponsePB resp;
+      RETURN_NOT_OK(proxy->IsInitDbDone(req, &resp, &rpc));
+      if (resp.has_error() &&
+          resp.error().code() != master::MasterErrorPB::NOT_THE_LEADER) {
+
+        return STATUS(RuntimeError, Substitute(
+            "IsInitDbDone RPC response hit error: $0",
+            resp.error().ShortDebugString()));
+      }
+      if (resp.done()) {
+        if (resp.has_initdb_error() && !resp.initdb_error().empty()) {
+          LOG(ERROR) << "master reported an initdb error: " << resp.initdb_error();
+          return STATUS(RuntimeError, "initdb failed: " + resp.initdb_error());
+        }
+        LOG(INFO) << "master indicated that initdb is done";
+        return Status::OK();
+      }
+    }
+    std::this_thread::sleep_for(500ms);
+  }
+}
+
 string ExternalMiniCluster::GetBindIpForTabletServer(int index) const {
-  if (opts_.bind_to_unique_loopback_addresses) {
-    pid_t p = getpid();
-    CHECK_LE(p, MathLimits<uint16_t>::kMax)
-        << "bind_to_unique_loopback_addresses does not work on systems with >16-bit pid";
-    return Substitute("127.$0.$1.$2", p >> 8, p & 0xff, index);
+  if (opts_.use_even_ips) {
+    return Substitute("127.0.0.$0", (index + 1) * 2);
+  } else if (opts_.bind_to_unique_loopback_addresses) {
+#if defined(__APPLE__)
+    return Substitute("127.0.0.$0", index + 1); // Use default 127.0.0.x IPs.
+#else
+    const pid_t p = getpid();
+    return Substitute("127.$0.$1.$2", (p >> 8) & 0xff, p & 0xff, index);
+#endif
   } else {
     return "127.0.0.1";
   }
 }
 
-Status ExternalMiniCluster::AddTabletServer() {
+Status ExternalMiniCluster::AddTabletServer(bool start_cql_proxy, bool start_pgsql_proxy) {
   CHECK(GetLeaderMaster() != nullptr)
       << "Must have started at least 1 master before adding tablet servers";
 
@@ -872,21 +1037,43 @@ Status ExternalMiniCluster::AddTabletServer() {
     master_hostports.push_back(DCHECK_NOTNULL(master(i))->bound_rpc_hostport());
   }
 
-  const uint16_t ts_rpc_port = AllocateFreePort();
-  const uint16_t ts_http_port = AllocateFreePort();
-  const uint16_t redis_rpc_port = AllocateFreePort();
-  const uint16_t redis_http_port = AllocateFreePort();
-  const uint16_t cql_rpc_port = AllocateFreePort();
-  const uint16_t cql_http_port = AllocateFreePort();
-  const uint16_t pgsql_rpc_port = AllocateFreePort();
-  const uint16_t pgsql_http_port = AllocateFreePort();
+  uint16_t ts_rpc_port = 0;
+  uint16_t ts_http_port = 0;
+  uint16_t redis_rpc_port = 0;
+  uint16_t redis_http_port = 0;
+  uint16_t cql_rpc_port = 0;
+  uint16_t cql_http_port = 0;
+  uint16_t pgsql_rpc_port = 0;
+  uint16_t pgsql_http_port = 0;
+
+  if (idx > 0 && opts_.use_same_ts_ports && opts_.bind_to_unique_loopback_addresses) {
+    const scoped_refptr<ExternalTabletServer>& first_ts = tablet_servers_[0];
+    ts_rpc_port = first_ts->rpc_port();
+    ts_http_port = first_ts->http_port();
+    redis_rpc_port = first_ts->redis_rpc_port();
+    redis_http_port = first_ts->redis_http_port();
+    cql_rpc_port = first_ts->cql_rpc_port();
+    cql_http_port = first_ts->cql_http_port();
+    pgsql_rpc_port = first_ts->pgsql_rpc_port();
+    pgsql_http_port = first_ts->pgsql_http_port();
+  } else {
+    ts_rpc_port = AllocateFreePort();
+    ts_http_port = AllocateFreePort();
+    redis_rpc_port = AllocateFreePort();
+    redis_http_port = AllocateFreePort();
+    cql_rpc_port = AllocateFreePort();
+    cql_http_port = AllocateFreePort();
+    pgsql_rpc_port = AllocateFreePort();
+    pgsql_http_port = AllocateFreePort();
+  }
+
   scoped_refptr<ExternalTabletServer> ts = new ExternalTabletServer(
       idx, messenger_, exe, GetDataPath(Substitute("ts-$0", idx)), GetBindIpForTabletServer(idx),
       ts_rpc_port, ts_http_port, redis_rpc_port, redis_http_port,
       cql_rpc_port, cql_http_port,
       pgsql_rpc_port, pgsql_http_port,
       master_hostports, SubstituteInFlags(opts_.extra_tserver_flags, idx));
-  RETURN_NOT_OK(ts->Start());
+  RETURN_NOT_OK(ts->Start(start_cql_proxy, start_pgsql_proxy));
   tablet_servers_.push_back(ts);
   return Status::OK();
 }
@@ -895,33 +1082,55 @@ Status ExternalMiniCluster::WaitForTabletServerCount(int count, const MonoDelta&
   MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(timeout);
 
+  std::vector<scoped_refptr<ExternalTabletServer>> last_unmatched = tablet_servers_;
+  bool had_leader = false;
+
   while (true) {
-    MonoDelta remaining = deadline.GetDeltaSince(MonoTime::Now());
+    MonoDelta remaining = deadline - MonoTime::Now();
     if (remaining.ToSeconds() < 0) {
-      return STATUS(TimedOut, Substitute("$0 TS(s) never registered with master", count));
+      std::vector<std::string> unmatched_uuids;
+      unmatched_uuids.reserve(last_unmatched.size());
+      for (const auto& server : last_unmatched) {
+        unmatched_uuids.push_back(server->instance_id().permanent_uuid());
+      }
+      if (!had_leader) {
+        return STATUS(TimedOut, "Does not have active master leader to check tserver registration");
+      }
+      return STATUS_FORMAT(TimedOut, "$0 TS(s) never registered with master (not registered $1)",
+                           count, unmatched_uuids);
     }
 
+    // We should give some time for RPC to proceed, otherwise all requests would fail.
+    remaining = std::max<MonoDelta>(remaining, 250ms);
+
+    last_unmatched = tablet_servers_;
+    had_leader = false;
     for (int i = 0; i < masters_.size(); i++) {
       master::ListTabletServersRequestPB req;
       master::ListTabletServersResponsePB resp;
       rpc::RpcController rpc;
       rpc.set_timeout(remaining);
-      RETURN_NOT_OK_PREPEND(master_proxy(i)->ListTabletServers(req, &resp, &rpc),
-                            "ListTabletServers RPC failed");
+      auto status = master_proxy(i)->ListTabletServers(req, &resp, &rpc);
+      LOG_IF(WARNING, !status.ok()) << "ListTabletServers failed: " << status;
+      if (!status.ok() || resp.has_error()) {
+        continue;
+      }
+      had_leader = true;
       // ListTabletServers() may return servers that are no longer online.
       // Do a second step of verification to verify that the descs that we got
       // are aligned (same uuid/seqno) with the TSs that we have in the cluster.
       int match_count = 0;
       for (const master::ListTabletServersResponsePB_Entry& e : resp.servers()) {
-        for (const scoped_refptr<ExternalTabletServer>& ets : tablet_servers_) {
-          if (ets->instance_id().permanent_uuid() == e.instance_id().permanent_uuid() &&
-              ets->instance_id().instance_seqno() == e.instance_id().instance_seqno()) {
+        for (auto it = last_unmatched.begin(); it != last_unmatched.end(); ++it) {
+          if ((**it).instance_id().permanent_uuid() == e.instance_id().permanent_uuid() &&
+              (**it).instance_id().instance_seqno() == e.instance_id().instance_seqno()) {
             match_count++;
+            last_unmatched.erase(it);
             break;
           }
         }
       }
-      if (match_count == count) {
+      if (match_count >= count) {
         LOG(INFO) << count << " TS(s) registered with Master";
         return Status::OK();
       }
@@ -936,6 +1145,27 @@ void ExternalMiniCluster::AssertNoCrashes() {
     if (d->IsShutdown()) continue;
     EXPECT_TRUE(d->IsProcessAlive()) << "At least one process crashed";
   }
+}
+
+Result<std::vector<std::string>> ExternalMiniCluster::GetTabletIds(ExternalTabletServer* ts) {
+  TabletServerServiceProxy proxy(proxy_cache_.get(), ts->bound_rpc_addr());
+  ListTabletsRequestPB req;
+  ListTabletsResponsePB resp;
+
+  rpc::RpcController rpc;
+  rpc.set_timeout(MonoDelta::FromSeconds(10));
+  RETURN_NOT_OK(proxy.ListTablets(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  std::vector<std::string> result;
+  result.reserve(resp.status_and_schema().size());
+  for (const StatusAndSchemaPB& status : resp.status_and_schema()) {
+    result.push_back(status.tablet_status().tablet_id());
+  }
+
+  return result;
 }
 
 Status ExternalMiniCluster::WaitForTabletsRunning(ExternalTabletServer* ts,
@@ -1013,8 +1243,7 @@ Status ExternalMiniCluster::GetPeerMasterIndex(int* idx, bool is_leader) {
   Synchronizer sync;
   server::MasterAddresses addrs;
   HostPort leader_master_hp;
-  MonoTime deadline = MonoTime::Now();
-  deadline.AddDelta(MonoDelta::FromSeconds(5));
+  auto deadline = CoarseMonoClock::Now() + 5s;
 
   *idx = 0;  // default to 0'th index, even in case of errors.
 
@@ -1113,12 +1342,21 @@ vector<ExternalDaemon*> ExternalMiniCluster::daemons() const {
   return results;
 }
 
+std::vector<ExternalTabletServer*> ExternalMiniCluster::tserver_daemons() const {
+  std::vector<ExternalTabletServer*> result;
+  result.reserve(tablet_servers_.size());
+  for (const auto& ts : tablet_servers_) {
+    result.push_back(ts.get());
+  }
+  return result;
+}
+
 HostPort ExternalMiniCluster::pgsql_hostport(int node_index) const {
   return HostPort(tablet_servers_[node_index]->bind_host(),
                   tablet_servers_[node_index]->pgsql_rpc_port());
 }
 
-std::shared_ptr<rpc::Messenger> ExternalMiniCluster::messenger() {
+rpc::Messenger* ExternalMiniCluster::messenger() {
   return messenger_;
 }
 
@@ -1147,14 +1385,13 @@ std::shared_ptr<server::GenericServiceProxy> ExternalMiniCluster::master_generic
   return std::make_shared<server::GenericServiceProxy>(proxy_cache_.get(), bound_rpc_addr);
 }
 
-Status ExternalMiniCluster::DoCreateClient(client::YBClientBuilder* builder,
-                                           std::shared_ptr<client::YBClient>* client) {
+void ExternalMiniCluster::ConfigureClientBuilder(client::YBClientBuilder* builder) {
+  CHECK_NOTNULL(builder);
   CHECK(!masters_.empty());
   builder->clear_master_server_addrs();
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
     builder->add_master_server_addr(master->bound_rpc_hostport().ToString());
   }
-  return builder->Build(client);
 }
 
 HostPort ExternalMiniCluster::DoGetLeaderMasterBoundRpcAddr() {
@@ -1206,7 +1443,7 @@ Status ExternalMiniCluster::StartElection(ExternalMaster* master) {
   req.set_tablet_id(yb::master::kSysCatalogTabletId);
   RunLeaderElectionResponsePB resp;
   RpcController rpc;
-  rpc.set_timeout(opts_.timeout_);
+  rpc.set_timeout(opts_.timeout);
   RETURN_NOT_OK(master_proxy->RunLeaderElection(req, &resp, &rpc));
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status())
@@ -1226,16 +1463,16 @@ namespace {
 // and is never deallocated.
 struct GlobalLogTailerState {
   mutex logging_mutex;
-  atomic<int> next_log_tailer_id;
+  atomic<int> next_log_tailer_id{0};
 
   // We need some references to these heap-allocated atomic booleans so that ASAN would not consider
   // them memory leaks.
   mutex id_to_stopped_flag_mutex;
   map<int, atomic<bool>*> id_to_stopped_flag;
 
-  GlobalLogTailerState() {
-    next_log_tailer_id.store(0);
-  }
+  // This is used to limit the total amount of logs produced by external daemons over the lifetime
+  // of a test program. Guarded by logging_mutex.
+  size_t total_bytes_logged = 0;
 };
 
 }  // anonymous namespace
@@ -1268,16 +1505,27 @@ class ExternalDaemon::LogTailerThread {
           // The "stopped" flag itself is never deallocated.
           bool is_eof = false;
           bool is_fgets_null = false;
+          auto& logging_mutex = global_state()->logging_mutex;
+          auto& total_bytes_logged = global_state()->total_bytes_logged;
           while (!(is_eof = feof(fp)) &&
                  !(is_fgets_null = (fgets(buf, sizeof(buf), fp) == nullptr)) &&
                  !stopped->load()) {
             size_t l = strlen(buf);
             const char* maybe_end_of_line = l > 0 && buf[l - 1] == '\n' ? "" : "\n";
             // Synchronize tailing output from all external daemons for simplicity.
-            lock_guard<mutex> lock(global_state()->logging_mutex);
+            lock_guard<mutex> lock(logging_mutex);
             if (stopped->load()) break;
             // Make sure we always output an end-of-line character.
             *out << line_prefix << " " << buf << maybe_end_of_line;
+            if (!stopped->load()) {
+              auto listener = listener_.load(std::memory_order_acquire);
+              if (!stopped->load() && listener) {
+                listener->Handle(GStringPiece(buf, maybe_end_of_line ? l : l - 1));
+              }
+            }
+            total_bytes_logged += strlen(buf) + strlen(maybe_end_of_line);
+            // Abort the test if it produces too much log spew.
+            CHECK_LE(total_bytes_logged, FLAGS_external_mini_cluster_max_log_bytes);
           }
           fclose(fp);
           if (!stopped->load()) {
@@ -1291,10 +1539,19 @@ class ExternalDaemon::LogTailerThread {
     thread_.detach();
   }
 
+  void SetListener(StringListener* listener) {
+    listener_ = listener;
+  }
+
+  void RemoveListener(StringListener* listener) {
+    listener_.compare_exchange_strong(listener, nullptr);
+  }
+
   ~LogTailerThread() {
     VLOG(1) << "Stopping " << thread_desc_;
     lock_guard<mutex> l(state_lock_);
     stopped_->store(true);
+    listener_ = nullptr;
   }
 
  private:
@@ -1323,11 +1580,12 @@ class ExternalDaemon::LogTailerThread {
   atomic<bool>* const stopped_;
   const string thread_desc_;  // A human-readable description of this thread.
   thread thread_;
+  std::atomic<StringListener*> listener_{nullptr};
 };
 
 ExternalDaemon::ExternalDaemon(
     std::string daemon_id,
-    std::shared_ptr<rpc::Messenger> messenger,
+    rpc::Messenger* messenger,
     string exe,
     string data_dir,
     string server_type,
@@ -1383,7 +1641,11 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   // Even though we set -logtostderr down below, metrics logs end up being written
   // based on -log_dir. So, we have to set that too.
   argv.push_back("--metrics_log_interval_ms=1000");
-  argv.push_back("--log_dir=" + full_data_dir_);
+
+  // Force set log_dir to empty value, process will chose default destination inside fs_data_dir
+  // In other case log_dir value will be extracted from TEST_TMPDIR env variable but it is
+  // inherited from test script
+  argv.push_back("--log_dir=");
 
   // Then the "extra flags" passed into the ctor (from the ExternalMiniCluster
   // options struct). These come at the end so they can override things like
@@ -1402,12 +1664,11 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   // A previous instance of the daemon may have run in the same directory. So, remove
   // the previous info file if it's there.
   Status s = DeleteServerInfoPaths();
-  if (!s.ok()) {
+  if (!s.ok() && !s.IsNotFound()) {
     LOG (WARNING) << "Failed to delete info paths: " << s.ToString();
   }
 
-  // Ensure that logging goes to the test output and doesn't get buffered.
-  argv.push_back("--logtostderr");
+  // Ensure that logging goes to the test output doesn't get buffered.
   argv.push_back("--logbuflevel=-1");
 
   // Use the same verbose logging level in the child process as in the test driver.
@@ -1422,6 +1683,9 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   }
   if (FLAGS_mem_tracker_log_stack_trace) {
     argv.push_back("--mem_tracker_log_stack_trace");
+  }
+  if (FLAGS_use_libbacktrace) {
+    argv.push_back("--use_libbacktrace");
   }
 
   const char* test_invocation_id = getenv("YB_TEST_INVOCATION_ID");
@@ -1438,6 +1702,8 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
       "--fatal_details_path_prefix=$0.$1", GetFatalDetailsPathPrefix(), daemon_id_));
 
   argv.push_back(Format("--minicluster_daemon_id=$0", daemon_id_));
+
+  AddExtraFlagsFromEnvVar("YB_EXTRA_DAEMON_FLAGS", &argv);
 
   gscoped_ptr<Subprocess> p(new Subprocess(exe_, argv));
   p->ShareParentStdout(false);
@@ -1581,7 +1847,7 @@ void ExternalDaemon::Shutdown() {
       ignore_result(process_->Kill(SIGKILL));
     }
   }
-  int ret;
+  int ret = 0;
   WARN_NOT_OK(process_->Wait(&ret), "Waiting on " + exe_);
   process_.reset();
 }
@@ -1638,15 +1904,16 @@ const string& ExternalDaemon::uuid() const {
   return status_->node_instance().permanent_uuid();
 }
 
-Status ExternalDaemon::GetInt64Metric(const MetricEntityPrototype* entity_proto,
-                                      const char* entity_id,
-                                      const MetricPrototype* metric_proto,
-                                      const char* value_field,
-                                      int64_t* value) const {
+Status ExternalDaemon::GetInt64MetricFromHost(const HostPort& hostport,
+                                              const MetricEntityPrototype* entity_proto,
+                                              const char* entity_id,
+                                              const MetricPrototype* metric_proto,
+                                              const char* value_field,
+                                              int64_t* value) {
   // Fetch metrics whose name matches the given prototype.
   string url = Substitute(
       "http://$0/jsonmetricz?metrics=$1",
-      bound_http_hostport().ToString(),
+      hostport.ToString(),
       metric_proto->name());
   EasyCurl curl;
   faststring dst;
@@ -1701,6 +1968,39 @@ string ExternalDaemon::LogPrefix() {
   return Format("{ daemon_id: $0 bound_rpc: $1 } ", daemon_id_, bound_rpc_);
 }
 
+void ExternalDaemon::SetLogListener(StringListener* listener) {
+  stdout_tailer_thread_->SetListener(listener);
+  stderr_tailer_thread_->SetListener(listener);
+}
+
+void ExternalDaemon::RemoveLogListener(StringListener* listener) {
+  stdout_tailer_thread_->RemoveListener(listener);
+  stderr_tailer_thread_->RemoveListener(listener);
+}
+
+LogWaiter::LogWaiter(ExternalDaemon* daemon, const std::string& string_to_wait) :
+    daemon_(daemon), string_to_wait_(string_to_wait) {
+  daemon_->SetLogListener(this);
+}
+
+void LogWaiter::Handle(const GStringPiece& s) {
+  if (s.contains(string_to_wait_)) {
+    event_occurred_ = true;
+  }
+}
+
+Status LogWaiter::WaitFor(const MonoDelta timeout) {
+  constexpr auto kInitialWaitPeriod = 100ms;
+  return ::yb::WaitFor(
+      [this]{ return event_occurred_.load(); }, timeout,
+      Format("Waiting for log record '$0' on $1...", string_to_wait_, daemon_->id()),
+      kInitialWaitPeriod);
+}
+
+LogWaiter::~LogWaiter() {
+  daemon_->RemoveLogListener(this);
+}
+
 //------------------------------------------------------------
 // ScopedResumeExternalDaemon
 //------------------------------------------------------------
@@ -1718,7 +2018,7 @@ ScopedResumeExternalDaemon::~ScopedResumeExternalDaemon() {
 //------------------------------------------------------------
 ExternalMaster::ExternalMaster(
     int master_index,
-    const std::shared_ptr<rpc::Messenger>& messenger,
+    rpc::Messenger* messenger,
     const string& exe,
     const string& data_dir,
     const std::vector<string>& extra_flags,
@@ -1768,7 +2068,7 @@ Status ExternalMaster::Restart() {
 //------------------------------------------------------------
 
 ExternalTabletServer::ExternalTabletServer(
-    int tablet_server_index, const std::shared_ptr<rpc::Messenger>& messenger,
+    int tablet_server_index, rpc::Messenger* messenger,
     const std::string& exe, const std::string& data_dir, std::string bind_host, uint16_t rpc_port,
     uint16_t http_port, uint16_t redis_rpc_port, uint16_t redis_http_port,
     uint16_t cql_rpc_port, uint16_t cql_http_port,
@@ -1791,9 +2091,10 @@ ExternalTabletServer::ExternalTabletServer(
 ExternalTabletServer::~ExternalTabletServer() {
 }
 
-Status ExternalTabletServer::Start(bool start_cql_proxy) {
+Status ExternalTabletServer::Start(bool start_cql_proxy, bool start_pgsql_proxy) {
   vector<string> flags;
   start_cql_proxy_ = start_cql_proxy;
+  enable_ysql_ = start_pgsql_proxy;
   flags.push_back("--fs_data_dirs=" + data_dir_);
   flags.push_back(Substitute("--rpc_bind_addresses=$0:$1",
                              bind_host_, rpc_port_));
@@ -1807,6 +2108,8 @@ Status ExternalTabletServer::Start(bool start_cql_proxy) {
   flags.push_back(Substitute("--cql_proxy_bind_address=$0:$1", bind_host_, cql_rpc_port_));
   flags.push_back(Substitute("--cql_proxy_webserver_port=$0", cql_http_port_));
   flags.push_back(Substitute("--start_cql_proxy=$0", start_cql_proxy_));
+  flags.push_back(Substitute("--start_pgsql_proxy=$0", enable_ysql_));
+  flags.push_back(Substitute("--enable_ysql=$0", enable_ysql_));
   flags.push_back("--tserver_master_addrs=" + master_addrs_);
 
   // Use conservative number of threads for the mini cluster for unit test env
@@ -1849,7 +2152,7 @@ Status ExternalTabletServer::DeleteServerInfoPaths() {
   return Status::OK();
 }
 
-Status ExternalTabletServer::Restart(bool start_cql_proxy) {
+Status ExternalTabletServer::Restart(bool start_cql_proxy, bool start_pgsql_proxy) {
   LOG_WITH_PREFIX(INFO) << "Restart: start_cql_proxy=" << start_cql_proxy;
   if (!IsProcessAlive()) {
     // Make sure this function could be safely called if the process has already crashed.
@@ -1859,7 +2162,7 @@ Status ExternalTabletServer::Restart(bool start_cql_proxy) {
   if (bound_rpc_.port() == 0) {
     return STATUS(IllegalState, "Tablet server cannot be restarted. Must call Shutdown() first.");
   }
-  return Start(start_cql_proxy);
+  return Start(start_cql_proxy, start_pgsql_proxy);
 }
 
 }  // namespace yb

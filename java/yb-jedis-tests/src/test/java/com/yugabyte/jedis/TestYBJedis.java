@@ -65,6 +65,53 @@ public class TestYBJedis extends BaseJedisTest {
   }
 
   @Test
+  public void testKeysWithDelete() throws Exception {
+    assertEquals("OK", jedis_client.set("k1", "v1"));
+    assertEquals("OK", jedis_client.set("k2", "v2"));
+
+    Map<Long, String> ts = new HashMap<>();
+    ts.put(10L, "v1");
+    ts.put(20L, "v2");
+    ts.put(30L, "v3");
+    ts.put(40L, "v4");
+    ts.put(50L, "v5");
+    assertEquals("OK", jedis_client.tsadd("k3", ts));
+
+    Map<String, Double> pairs = new HashMap<String, Double>();
+    pairs.put("v0", 0.0);
+    pairs.put("v1", 1.0);
+    assertEquals(2L, jedis_client.zadd("k4", pairs).longValue());
+
+    Set<String> keys = new HashSet<String>(Arrays.asList("k1", "k2", "k3", "k4"));
+
+    // Test all 4 keys in the db.
+    assertEquals(keys, jedis_client.keys("*"));
+
+    // Make sure expired and deleted entries don't show up.
+    assertEquals(1L, jedis_client.del("k2").longValue());
+    assertEquals(1L, jedis_client.expire("k4", 2).longValue());
+    keys.remove("k2");
+    keys.remove("k4");
+
+    // Make sure ts with only one entry expired still shows up.
+    Map<Long, String> ts_exp = new HashMap<>();
+    ts_exp.put(0L, "v0");
+    assertEquals("OK", jedis_client.tsadd("k3", ts_exp, "EXPIRE_IN", 2));
+    Thread.sleep(2000);
+
+    // Test k1 and k3 still in db.
+    assertEquals(keys, jedis_client.keys("*"));
+
+    //Now add back keys and make sure they show up.
+    assertEquals("OK", jedis_client.set("k2", "v2"));
+    assertEquals("OK", jedis_client.set("k4", "v4"));
+    keys.add("k2");
+    keys.add("k4");
+
+    assertEquals(keys, jedis_client.keys("*"));
+  }
+
+  @Test
   public void testZScore() throws Exception {
     Map<String, Double> pairs = new HashMap<String, Double>();
     pairs.put("v0", 0.0);
@@ -158,6 +205,43 @@ public class TestYBJedis extends BaseJedisTest {
       return;
     }
     assertTrue(false);
+  }
+
+  @Test
+  public void testKeys() throws Exception {
+    Map <String, String> fields = new HashMap<>();
+    fields.put("f1", "v1");
+    fields.put("f2", "v2");
+    fields.put("f3", "v3");
+    for (int i = 0; i < 100; i++) {
+      for (int j = 0; j < 100; j++) {
+        String str = String.format("key_%d_%d", i, j);
+        if (i < 32) {
+          assertEquals("OK", jedis_client.set(str, "v"));
+        } else if (i < 65) {
+          assertEquals("OK", jedis_client.hmset(str, fields));
+        } else {
+          assertEquals(1L, jedis_client.zadd(str, 1, "a").longValue());
+        }
+      }
+    }
+
+    assertEquals(10000, jedis_client.keys("*").size());
+    assertEquals(10000, jedis_client.keys("key_*_*").size());
+    assertEquals(100, jedis_client.keys("key_*_20").size());
+    assertEquals(1000, jedis_client.keys("key_?_*").size());
+    assertEquals(36, jedis_client.keys("key_[0123]_[^0]").size());
+    assertEquals(0, jedis_client.keys("\\*").size());
+
+    assertEquals("OK", jedis_client.set("key_over_limit", "v"));
+    assertEquals(100, jedis_client.keys("key_?_?").size());
+
+    try {
+      jedis_client.keys("*");
+      fail("Should have failed!");
+    } catch (Exception e) {
+      LOG.info("Expected exception", e);
+    }
   }
 
   @Test

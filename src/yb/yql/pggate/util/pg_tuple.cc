@@ -17,10 +17,13 @@
 #include "yb/util/ybc-internal.h"
 #include "yb/client/client.h"
 
+#include "postgres/src/include/pg_config_manual.h"
+
 namespace yb {
 namespace pggate {
 
-PgTuple::PgTuple(uint64_t *datums, bool *isnulls) : datums_(datums), isnulls_(isnulls) {
+PgTuple::PgTuple(uint64_t *datums, bool *isnulls, PgSysColumns *syscols)
+    : datums_(datums), isnulls_(isnulls), syscols_(syscols) {
 }
 
 void PgTuple::WriteNull(int index, const PgWireDataHeader& header) {
@@ -28,52 +31,18 @@ void PgTuple::WriteNull(int index, const PgWireDataHeader& header) {
   datums_[index] = 0;
 }
 
-void PgTuple::Write(int index, const PgWireDataHeader& header, bool value) {
+void PgTuple::WriteDatum(int index, uint64_t datum) {
   isnulls_[index] = false;
-  datums_[index] = value ? 1 : 0;
+  datums_[index] = datum;
 }
 
-void PgTuple::Write(int index, const PgWireDataHeader& header, int16_t value) {
-  isnulls_[index] = false;
-  datums_[index] = value;
-}
-
-void PgTuple::Write(int index, const PgWireDataHeader& header, int32_t value) {
-  isnulls_[index] = false;
-  datums_[index] = value;
-}
-
-void PgTuple::Write(int index, const PgWireDataHeader& header, int64_t value) {
-  isnulls_[index] = false;
-  datums_[index] = value;
-}
-
-void PgTuple::Write(int index, const PgWireDataHeader& header, float value) {
-  isnulls_[index] = false;
-  datums_[index] = *reinterpret_cast<uint32_t*>(&value);
-}
-
-void PgTuple::Write(int index, const PgWireDataHeader& header, double value) {
-  isnulls_[index] = false;
-  datums_[index] = *reinterpret_cast<uint64_t*>(&value);
-}
-
-void PgTuple::Write(int index, const PgWireDataHeader& header, const char *value, int64_t bytes) {
-  isnulls_[index] = false;
-
-  // Null terminate the data.
-  char *datum = static_cast<char*>(YBCPAlloc(bytes + 1));
-  memcpy(datum, value, bytes);
-  datum[bytes] = 0;
-  datums_[index] = reinterpret_cast<uint64_t>(datum);
-}
-
-// TODO(neil) Once we serialize and deserialize binary types on Posgres side, we can implement
-// this function properly. Raise exception for now.
-void PgTuple::Write(int index, const PgWireDataHeader& header, const uint8_t *value,
+void PgTuple::Write(uint8_t **pgbuf, const PgWireDataHeader& header, const uint8_t *value,
                     int64_t bytes) {
-  isnulls_[index] = false;
-  LOG(FATAL) << "Not yet supported";
+  // TODO: return a status instead of crashing.
+  CHECK_LE(bytes, kYBCMaxPostgresTextSizeBytes);
+  CHECK_GE(bytes, 0);
+  *pgbuf = static_cast<uint8_t*>(YBCCStringToTextWithLen(reinterpret_cast<const char*>(value),
+                                                         static_cast<int>(bytes)));
 }
 
 }  // namespace pggate

@@ -22,9 +22,11 @@
 #include "yb/common/ql_expr.h"
 #include "yb/common/ql_rowblock.h"
 #include "yb/common/common.pb.h"
+#include "yb/rpc/thread_pool.h"
 #include "yb/yql/cql/ql/exec/exec_context.h"
 #include "yb/yql/cql/ql/ptree/pt_create_keyspace.h"
 #include "yb/yql/cql/ql/ptree/pt_use_keyspace.h"
+#include "yb/yql/cql/ql/ptree/pt_alter_keyspace.h"
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
 #include "yb/yql/cql/ql/ptree/pt_alter_table.h"
 #include "yb/yql/cql/ql/ptree/pt_create_type.h"
@@ -39,10 +41,16 @@
 #include "yb/yql/cql/ql/ptree/pt_update.h"
 #include "yb/yql/cql/ql/ptree/pt_transaction.h"
 #include "yb/yql/cql/ql/ptree/pt_truncate.h"
+#include "yb/yql/cql/ql/ptree/pt_explain.h"
 #include "yb/yql/cql/ql/util/statement_params.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
 
 namespace yb {
+
+namespace client {
+class YBColumnSpec;
+} // namespace client
+
 namespace ql {
 
 class QLMetrics;
@@ -58,12 +66,9 @@ class Executor : public QLExprExecutor {
   typedef std::unique_ptr<Executor> UniPtr;
   typedef std::unique_ptr<const Executor> UniPtrConst;
 
-  // Function to reschedule the current call.
-  using Rescheduler = std::function<void(std::function<void()>)>;
-
   //------------------------------------------------------------------------------------------------
   // Constructor & destructor.
-  Executor(QLEnv *ql_env, Rescheduler rescheduler, const QLMetrics* ql_metrics);
+  Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics);
   virtual ~Executor();
 
   // Execute the given statement (parse tree) or batch. The parse trees and the parameters must not
@@ -79,6 +84,23 @@ class Executor : public QLExprExecutor {
 
   // Execute a parse tree.
   CHECKED_STATUS Execute(const ParseTree& parse_tree, const StatementParameters& params);
+
+  // Run runtime analysis and prepare for execution within the execution context.
+  // Serves for processing things unavailable for initial semantic analysis.
+  CHECKED_STATUS PreExecTreeNode(TreeNode *tnode);
+
+  CHECKED_STATUS PreExecTreeNode(PTInsertStmt *tnode);
+
+  CHECKED_STATUS PreExecTreeNode(PTInsertJsonClause *tnode);
+
+  // Convert JSON value to an expression acording to its given expected type
+  Result<PTExpr::SharedPtr> ConvertJsonToExpr(const rapidjson::Value& json_value,
+                                              const QLType::SharedPtr& type,
+                                              const YBLocation::SharedPtr& loc);
+
+  Result<PTExpr::SharedPtr> ConvertJsonToExprInner(const rapidjson::Value& json_value,
+                                                   const QLType::SharedPtr& type,
+                                                   const YBLocation::SharedPtr& loc);
 
   // Execute any TreeNode. This function determines how to execute a node.
   CHECKED_STATUS ExecTreeNode(const TreeNode *tnode);
@@ -128,6 +150,9 @@ class Executor : public QLExprExecutor {
   // Update statement.
   CHECKED_STATUS ExecPTNode(const PTUpdateStmt *tnode, TnodeContext* tnode_context);
 
+  // Explain statement.
+  CHECKED_STATUS ExecPTNode(const PTExplainStmt *tnode);
+
   // Truncate statement.
   CHECKED_STATUS ExecPTNode(const PTTruncateStmt *tnode);
 
@@ -142,6 +167,9 @@ class Executor : public QLExprExecutor {
 
   // Use a keyspace.
   CHECKED_STATUS ExecPTNode(const PTUseKeyspace *tnode);
+
+  // Alter a keyspace.
+  CHECKED_STATUS ExecPTNode(const PTAlterKeyspace *tnode);
 
   //------------------------------------------------------------------------------------------------
   // Result processing.
@@ -180,8 +208,8 @@ class Executor : public QLExprExecutor {
   using OpErrors = std::unordered_map<const client::YBqlOp*, Status>;
   CHECKED_STATUS ProcessAsyncStatus(const OpErrors& op_errors, ExecContext* exec_context);
 
-  // Append execution result.
-  CHECKED_STATUS AppendResult(const RowsResult::SharedPtr& result);
+  // Append rows result.
+  CHECKED_STATUS AppendRowsResult(RowsResult::SharedPtr&& rows_result);
 
   // Continue a multi-partition select (e.g. table scan or query with 'IN' condition on hash cols).
   Result<bool> FetchMoreRows(const PTSelectStmt* tnode,
@@ -189,8 +217,14 @@ class Executor : public QLExprExecutor {
                              TnodeContext* tnode_context,
                              ExecContext* exec_context);
 
+  // Fetch rows for a select statement using primary keys selected from an uncovered index.
+  Result<bool> FetchRowsByKeys(const PTSelectStmt* tnode,
+                               const client::YBqlReadOpPtr& select_op,
+                               const QLRowBlock& keys,
+                               TnodeContext* tnode_context);
+
   // Aggregate all result sets from all tablet servers to form the requested resultset.
-  CHECKED_STATUS AggregateResultSets(const PTSelectStmt* pt_select);
+  CHECKED_STATUS AggregateResultSets(const PTSelectStmt* pt_select, TnodeContext* tnode_context);
   CHECKED_STATUS EvalCount(const std::shared_ptr<QLRowBlock>& row_block,
                            int column_index,
                            QLValue *ql_value);
@@ -289,6 +323,11 @@ class Executor : public QLExprExecutor {
   // Convert column arguments to protobuf.
   CHECKED_STATUS ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req);
 
+  // Convert INSERT JSON clause to protobuf.
+  CHECKED_STATUS InsertJsonClauseToPB(const PTInsertStmt *insert_stmt,
+                                      const PTInsertJsonClause *json_clause,
+                                      QLWriteRequestPB *req);
+
   //------------------------------------------------------------------------------------------------
   // Where clause evaluation.
 
@@ -308,11 +347,17 @@ class Executor : public QLExprExecutor {
                                  const MCList<ColumnOp>& where_ops,
                                  const MCList<SubscriptedColumnOp>& subcol_where_ops);
 
+  // Set a primary key in a read request.
+  CHECKED_STATUS WhereKeyToPB(QLReadRequestPB *req, const Schema& schema, const QLRow& key);
+
   // Convert an expression op in where clause to protobuf.
   CHECKED_STATUS WhereOpToPB(QLConditionPB *condition, const ColumnOp& col_op);
   CHECKED_STATUS WhereSubColOpToPB(QLConditionPB *condition, const SubscriptedColumnOp& subcol_op);
   CHECKED_STATUS WhereJsonColOpToPB(QLConditionPB *condition, const JsonColumnOp& jsoncol_op);
   CHECKED_STATUS FuncOpToPB(QLConditionPB *condition, const FuncOp& func_op);
+
+  //------------------------------------------------------------------------------------------------
+  CHECKED_STATUS ColumnOpsToSchema(const PTColumnDefinition *col, client::YBColumnSpec *col_spec);
 
   //------------------------------------------------------------------------------------------------
   // Add a read/write operation for the current statement and apply it. For write operation, check
@@ -364,7 +409,7 @@ class Executor : public QLExprExecutor {
   QLEnv *ql_env_;
 
   // A rescheduler to reschedule the current call.
-  const Rescheduler rescheduler_;
+  Rescheduler* const rescheduler_;
 
   // Execution context of the statement currently being executed, and the contexts for all
   // statements in execution. The contexts are created and destroyed for each execution.
@@ -398,7 +443,64 @@ class Executor : public QLExprExecutor {
 
   // Whether this is a batch with statements that returns status.
   boost::optional<bool> returns_status_batch_opt_;
+
+  class ProcessAsyncResultsTask : public rpc::ThreadPoolTask {
+   public:
+    ProcessAsyncResultsTask& Bind(Executor* executor) {
+      executor_ = executor;
+      return *this;
+    }
+
+    virtual ~ProcessAsyncResultsTask() {}
+
+   private:
+    void Run() override {
+      auto executor = executor_;
+      executor_ = nullptr;
+      executor->ProcessAsyncResults(true /* rescheduled */);
+    }
+
+    void Done(const Status& status) override {}
+
+    Executor* executor_ = nullptr;
+  };
+
+  friend class ProcessAsyncResultsTask;
+
+  ProcessAsyncResultsTask process_async_results_task_;
+
+  class FlushAsyncTask : public rpc::ThreadPoolTask {
+   public:
+    FlushAsyncTask& Bind(Executor* executor) {
+      executor_ = executor;
+      return *this;
+    }
+
+    virtual ~FlushAsyncTask() {}
+
+   private:
+    void Run() override {
+      auto executor = executor_;
+      executor_ = nullptr;
+      executor->FlushAsync();
+    }
+
+    void Done(const Status& status) override {}
+
+    Executor* executor_ = nullptr;
+  };
+
+  friend class FlushAsyncTask;
+
+  FlushAsyncTask flush_async_task_;
 };
+
+// Normalize the JSON object key according to CQL rules:
+// Key is made lowercase unless it's double-quoted - in which case double quotes are removed
+std::string NormalizeJsonKey(const std::string& key);
+
+// Create an appropriate QLExpressionPB depending on a column description
+QLExpressionPB* CreateQLExpression(QLWriteRequestPB *req, const ColumnDesc& col_desc);
 
 }  // namespace ql
 }  // namespace yb

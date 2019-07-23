@@ -20,10 +20,6 @@ import static org.yb.AssertionWrappers.assertNotNull;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertTrue;
 
-import org.yb.minicluster.Metrics;
-import org.yb.minicluster.MiniYBCluster;
-import org.yb.minicluster.MiniYBDaemon;
-
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSetFuture;
@@ -473,7 +469,7 @@ public class TestTransaction extends BaseCQLTest {
             Integer.valueOf(3), Integer.valueOf(3), "v3");
 
     thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
-    thrown.expectMessage("Table Not Found");
+    thrown.expectMessage("Object Not Found");
     Iterator<Row> rows = session.execute("SELECT * FROM system.transactions").iterator();
   }
 

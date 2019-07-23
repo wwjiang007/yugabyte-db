@@ -16,8 +16,13 @@
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 
 #include "yb/client/client.h"
+#include "yb/client/table.h"
+
+#include "yb/common/roles_permissions.h"
 #include "yb/util/flag_tags.h"
 #include "yb/yql/cql/ql/util/ql_env.h"
+
+DECLARE_bool(use_cassandra_authentication);
 
 namespace yb {
 namespace ql {
@@ -95,10 +100,15 @@ Status SemContext::LoadSchema(const shared_ptr<YBTable>& table,
 Status SemContext::LookupTable(const YBTableName& name,
                                const YBLocation& loc,
                                const bool write_table,
+                               const PermissionType permission,
                                shared_ptr<YBTable>* table,
                                bool* is_system,
                                MCVector<ColumnDesc>* col_descs,
                                MCVector<PTColumnDefinition::SharedPtr>* column_definitions) {
+  if (FLAGS_use_cassandra_authentication) {
+    RETURN_NOT_OK(CheckHasTablePermission(loc, permission, name.namespace_name(),
+                                          name.table_name()));
+  }
   *is_system = name.is_system();
   if (*is_system && write_table && client::FLAGS_yb_system_namespace_readonly) {
     return Error(loc, ErrorCode::SYSTEM_NAMESPACE_READONLY);
@@ -109,7 +119,7 @@ Status SemContext::LookupTable(const YBTableName& name,
   if (*table == nullptr || ((*table)->IsIndex() && !FLAGS_allow_index_table_read_write) ||
       // Only looking for CQL tables.
       (*table)->table_type() != client::YBTableType::YQL_TABLE_TYPE) {
-    return Error(loc, ErrorCode::TABLE_NOT_FOUND);
+    return Error(loc, ErrorCode::OBJECT_NOT_FOUND);
   }
 
   return LoadSchema(*table, col_descs, column_definitions);
@@ -125,7 +135,7 @@ Status SemContext::LookupIndex(const TableId& index_id,
   if (*index_table == nullptr || !(*index_table)->IsIndex() ||
       // Only looking for CQL Indexes.
       (*index_table)->table_type() != client::YBTableType::YQL_TABLE_TYPE) {
-    return Error(loc, ErrorCode::TABLE_NOT_FOUND);
+    return Error(loc, ErrorCode::OBJECT_NOT_FOUND);
   }
 
   return LoadSchema(*index_table, col_descs, column_definitions);
@@ -149,7 +159,7 @@ Status SemContext::MapSymbol(const MCString& name, PTAlterColumnDefinition *entr
 
 Status SemContext::MapSymbol(const MCString& name, PTCreateTable *entry) {
   if (symtab_[name].create_table_ != nullptr) {
-    return Error(entry, ErrorCode::DUPLICATE_TABLE);
+    return Error(entry, ErrorCode::DUPLICATE_OBJECT);
   }
   symtab_[name].create_table_ = entry;
   return Status::OK();
@@ -215,8 +225,8 @@ std::shared_ptr<QLType> SemContext::GetUDType(const string &keyspace_name,
   return type;
 }
 
-SymbolEntry *SemContext::SeekSymbol(const MCString& name) {
-  MCMap<MCString, SymbolEntry>::iterator iter = symtab_.find(name);
+const SymbolEntry *SemContext::SeekSymbol(const MCString& name) const {
+  MCMap<MCString, SymbolEntry>::const_iterator iter = symtab_.find(name);
   if (iter != symtab_.end()) {
     return &iter->second;
   }
@@ -231,8 +241,8 @@ PTColumnDefinition *SemContext::GetColumnDefinition(const MCString& col_name) {
   return entry->column_;
 }
 
-const ColumnDesc *SemContext::GetColumnDesc(const MCString& col_name) {
-  SymbolEntry * entry = SeekSymbol(col_name);
+const ColumnDesc *SemContext::GetColumnDesc(const MCString& col_name) const {
+  const SymbolEntry * entry = SeekSymbol(col_name);
   if (entry == nullptr) {
     return nullptr;
   }
@@ -277,11 +287,79 @@ const ColumnDesc *SemContext::GetColumnDesc(const MCString& col_name) {
   return entry->column_desc_;
 }
 
-void SemContext::Reset() {
-  symtab_.clear();
-  current_processing_id_ = SymbolEntry();
-  current_dml_stmt_ = nullptr;
-  sem_state_ = nullptr;
+Status SemContext::HasKeyspacePermission(PermissionType permission,
+                                         const NamespaceName& keyspace_name) {
+
+  DFATAL_OR_RETURN_ERROR_IF(keyspace_name.empty(),
+                            STATUS(InvalidArgument, "Invalid empty keyspace"));
+  return ql_env_->HasResourcePermission(get_canonical_keyspace(keyspace_name),
+                                        ObjectType::OBJECT_SCHEMA, permission, keyspace_name);
+}
+
+Status SemContext::CheckHasKeyspacePermission(const YBLocation& loc,
+                                              const PermissionType permission,
+                                              const NamespaceName& keyspace_name) {
+  auto s = HasKeyspacePermission(permission, keyspace_name);
+  if (!s.ok()) {
+    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);
+  }
+  return Status::OK();
+}
+
+Status SemContext::CheckHasTablePermission(const YBLocation &loc,
+                                           PermissionType permission,
+                                           const NamespaceName& keyspace_name,
+                                           const TableName& table_name) {
+  DFATAL_OR_RETURN_ERROR_IF(keyspace_name.empty(),
+                            STATUS_SUBSTITUTE(InvalidArgument, "Empty keyspace for table $0",
+                                              table_name));
+  DFATAL_OR_RETURN_ERROR_IF(table_name.empty(),
+                            STATUS(InvalidArgument, "Table name cannot be empty"));
+
+  auto s = ql_env_->HasTablePermission(keyspace_name, table_name, permission);
+  if (!s.ok()) {
+    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);
+  }
+  return Status::OK();
+}
+
+Status SemContext::CheckHasTablePermission(const YBLocation& loc,
+                                           const PermissionType permission,
+                                           client::YBTableName table_name) {
+  return CheckHasTablePermission(loc, permission, table_name.namespace_name(),
+                                 table_name.table_name());
+}
+
+Status SemContext::CheckHasRolePermission(const YBLocation& loc,
+                                          PermissionType permission,
+                                          const RoleName& role_name) {
+
+  auto s = ql_env_->HasRolePermission(role_name, permission);
+  if (!s.ok()) {
+    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);
+  }
+  return Status::OK();
+}
+
+Status SemContext::CheckHasAllKeyspacesPermission(const YBLocation& loc,
+                                                  PermissionType permission) {
+
+  auto s = ql_env_->HasResourcePermission(kRolesDataResource, ObjectType::OBJECT_SCHEMA,
+                                          permission);
+  if (!s.ok()) {
+    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);
+  }
+  return Status::OK();
+}
+
+Status SemContext::CheckHasAllRolesPermission(const YBLocation& loc,
+                                              PermissionType permission) {
+
+  auto s = ql_env_->HasResourcePermission(kRolesRoleResource, ObjectType::OBJECT_ROLE, permission);
+  if (!s.ok()) {
+    return Error(loc, s.message().ToBuffer().c_str(), ErrorCode::UNAUTHORIZED);
+  }
+  return Status::OK();
 }
 
 //--------------------------------------------------------------------------------------------------

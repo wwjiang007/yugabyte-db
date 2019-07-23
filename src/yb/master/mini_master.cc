@@ -49,6 +49,7 @@
 
 using strings::Substitute;
 
+DECLARE_bool(simulate_fs_create_failure);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 
@@ -70,9 +71,10 @@ MiniMaster::~MiniMaster() {
   }
 }
 
-Status MiniMaster::Start() {
+Status MiniMaster::Start(bool simulate_fs_create_failure) {
   CHECK(!running_);
   FLAGS_rpc_server_allow_ephemeral_ports = true;
+  FLAGS_simulate_fs_create_failure = simulate_fs_create_failure;
   RETURN_NOT_OK(StartOnPorts(rpc_port_, web_port_));
   return master_->WaitForCatalogManagerInit();
 }
@@ -121,8 +123,9 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
   opts->webserver_opts.port = web_port;
   opts->fs_opts.wal_paths = { fs_root_ };
   opts->fs_opts.data_paths = { fs_root_ };
-  opts->broadcast_addresses.push_back(VERIFY_RESULT(HostPort::FromString(server::TEST_RpcAddress(
-      index_, server::Private::kFalse), rpc_port)));
+  // A.B.C.D.xip.io resolves to A.B.C.D so it is very useful for testing.
+  opts->broadcast_addresses = {
+      HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
 
   if (!opts->has_placement_cloud()) {
     opts->SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
@@ -130,11 +133,12 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
 
   gscoped_ptr<Master> server(new YB_EDITION_NS_PREFIX Master(*opts));
   RETURN_NOT_OK(server->Init());
+
+  server::TEST_SetupConnectivity(server->messenger(), index_);
+
   RETURN_NOT_OK(server->StartAsync());
 
   master_.swap(server);
-
-  server::TEST_BreakConnectivity(master_->messenger().get(), index_);
 
   tunnel_ = std::make_unique<Tunnel>(&master_->messenger()->io_service());
   std::vector<Endpoint> local;
@@ -208,10 +212,6 @@ std::string MiniMaster::permanent_uuid() const {
 
 std::string MiniMaster::bound_rpc_addr_str() const {
   return yb::ToString(bound_rpc_addr());
-}
-
-size_t MiniMaster::NumSystemTables() const {
-  return master_->NumSystemTables();
 }
 
 } // namespace master

@@ -37,15 +37,18 @@
 #include <string>
 #include <vector>
 
+#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/opid_util.h"
-#include "yb/consensus/ref_counted_replicate.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
+
 #include "yb/util/async_util.h"
 #include "yb/util/locks.h"
 #include "yb/util/metrics.h"
-#include "yb/util/status.h"
+#include "yb/util/opid.h"
+#include "yb/util/restart_safe_clock.h"
+#include "yb/util/result.h"
 
 namespace yb {
 
@@ -70,6 +73,7 @@ class LogCache {
  public:
   LogCache(const scoped_refptr<MetricEntity>& metric_entity,
            const scoped_refptr<log::Log>& log,
+           const std::shared_ptr<MemTracker>& server_tracker,
            const std::string& local_uuid,
            const std::string& tablet_id);
   ~LogCache();
@@ -81,8 +85,8 @@ class LogCache {
   // Requires that the cache is empty.
   void Init(const OpId& preceding_op);
 
-  // Read operations from the log, following 'after_op_index'.  If such an op exists in the log, an
-  // OK result will always include at least one operation.
+  // Read operations from the log, following 'after_op_index'.
+  // If such an op exists in the log, an OK result will always include at least one operation.
   //
   // The result will be limited such that the total ByteSize() of the returned ops is less than
   // max_size_bytes, unless that would result in an empty result, in which case exactly one op is
@@ -95,9 +99,21 @@ class LogCache {
   // from disk. Therefore, this function may take a substantial amount of time and should not be
   // called with important locks held, etc.
   CHECKED_STATUS ReadOps(int64_t after_op_index,
-                 int max_size_bytes,
-                 ReplicateMsgs* messages,
-                 OpId* preceding_op);
+                         int max_size_bytes,
+                         ReplicateMsgs* messages,
+                         OpId* preceding_op,
+                         bool* have_more_messages = nullptr);
+
+  // Same as above but also includes a 'to_op_index' parameter which will be used to limit results
+  // until 'to_op_index' (inclusive).
+  //
+  // If 'to_op_index' is 0, then all operations after 'after_op_index' will be included.
+  CHECKED_STATUS ReadOps(int64_t after_op_index,
+                         int64_t to_op_index,
+                         int max_size_bytes,
+                         ReplicateMsgs* messages,
+                         OpId* preceding_op,
+                         bool* have_more_messages = nullptr);
 
   // Append the operations into the log and the cache.  When the messages have completed writing
   // into the on-disk log, fires 'callback'.
@@ -106,7 +122,8 @@ class LogCache {
   // callback fires.
   //
   // Returns non-OK if the Log append itself fails.
-  CHECKED_STATUS AppendOperations(const ReplicateMsgs& msgs,
+  CHECKED_STATUS AppendOperations(const ReplicateMsgs& msgs, const yb::OpId& committed_op_id,
+                                  RestartSafeCoarseTimePoint batch_mono_time,
                                   const StatusCallback& callback);
 
   // Return true if an operation with the given index has been written through the cache. The
@@ -177,6 +194,17 @@ class LogCache {
                    bool borrowed_memory,
                    const StatusCallback& user_callback,
                    const Status& log_status);
+
+  struct PrepareAppendResult {
+    // Mem required to store provided operations.
+    int64_t mem_required = 0;
+    // Last idx in batch of provided operations.
+    int64_t last_idx_in_batch = -1;
+    // true if we exceeded mem tracker limit while preparing provided operations.
+    bool borrowed_memory = false;
+  };
+
+  Result<PrepareAppendResult> PrepareAppendOperations(const ReplicateMsgs& msgs);
 
   scoped_refptr<log::Log> const log_;
 

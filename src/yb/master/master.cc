@@ -115,7 +115,6 @@ DEFINE_int32(master_remote_bootstrap_svc_queue_length, 50,
              "RPC queue length for master remote bootstrap service");
 TAG_FLAG(master_remote_bootstrap_svc_queue_length, advanced);
 
-DECLARE_int64(inbound_rpc_block_size);
 DECLARE_int64(inbound_rpc_memory_limit);
 
 namespace yb {
@@ -134,18 +133,14 @@ Master::Master(const MasterOptions& opts)
     maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
     metric_entity_cluster_(METRIC_ENTITY_cluster.Instantiate(metric_registry_.get(),
                                                              "yb.cluster")),
-    master_tablet_server_(new MasterTabletServer(metric_entity())) {
+    master_tablet_server_(new MasterTabletServer(this, metric_entity())) {
   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(
-      GetAtomicFlag(&FLAGS_inbound_rpc_block_size),
       GetAtomicFlag(&FLAGS_inbound_rpc_memory_limit),
       mem_tracker()));
 }
 
 Master::~Master() {
   Shutdown();
-  if (messenger_) {
-    messenger_->Shutdown();
-  }
 }
 
 string Master::ToString() const {
@@ -189,13 +184,19 @@ Status Master::RegisterServices() {
       new ConsensusServiceImpl(metric_entity(), catalog_manager_.get()));
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_master_consensus_svc_queue_length,
                                                      std::move(consensus_service),
-                                                     server::ServicePriority::kHigh));
+                                                     rpc::ServicePriority::kHigh));
 
   std::unique_ptr<ServiceIf> remote_bootstrap_service(
       new RemoteBootstrapServiceImpl(fs_manager_.get(), catalog_manager_.get(), metric_entity()));
   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(FLAGS_master_remote_bootstrap_svc_queue_length,
                                                      std::move(remote_bootstrap_service)));
   return Status::OK();
+}
+
+void Master::DisplayGeneralInfoIcons(std::stringstream* output) {
+  server::RpcAndWebServerBase::DisplayGeneralInfoIcons(output);
+  // Tasks.
+  DisplayIconTile(output, "fa-list-ul", "Tasks", "/tasks");
 }
 
 Status Master::StartAsync() {
@@ -264,6 +265,10 @@ void Master::Shutdown() {
     string name = ToString();
     LOG(INFO) << name << " shutting down...";
     maintenance_manager_->Shutdown();
+    // We shutdown RpcAndWebServerBase here in order to shutdown messenger and reactor threads
+    // before shutting down catalog manager. This is needed to prevent async calls callbacks
+    // (running on reactor threads) from trying to use catalog manager thread pool which would be
+    // already shutdown.
     RpcAndWebServerBase::Shutdown();
     catalog_manager_->Shutdown();
     LOG(INFO) << name << " shutdown complete.";
@@ -392,10 +397,6 @@ Status Master::GoIntoShellMode() {
   maintenance_manager_->Shutdown();
   RETURN_NOT_OK(catalog_manager()->GoIntoShellMode());
   return Status::OK();
-}
-
-size_t Master::NumSystemTables() const {
-  return catalog_manager_->NumSystemTables();
 }
 
 } // namespace master

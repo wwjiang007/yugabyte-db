@@ -55,7 +55,7 @@ struct ChildTransactionData {
 // to indicate that this session will send commands related to this transaction.
 class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
  public:
-  YBTransaction(TransactionManager* manager, IsolationLevel isolation);
+  explicit YBTransaction(TransactionManager* manager);
 
   // Creates "child" transaction.
   // Child transaction shares same metadata as parent transaction, so all writes are done
@@ -67,15 +67,26 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
   ~YBTransaction();
 
+  // Should be invoked to complete transaction creation.
+  // Transaction is unusable before Init is called.
+  CHECKED_STATUS Init(
+      IsolationLevel isolation, const ReadHybridTime& read_time = ReadHybridTime());
+
+  // Allows starting a transaction that reuses an existing read point.
+  void InitWithReadPoint(IsolationLevel isolation, ConsistentReadPoint&& read_point);
+
   // This function is used to init metadata of Write/Read request.
   // If we don't have enough information, then the function returns false and stores
   // the waiter, which will be invoked when we obtain such information.
   bool Prepare(const std::unordered_set<internal::InFlightOpPtr>& ops,
+               ForceConsistentRead force_consistent_read,
                Waiter waiter,
-               TransactionMetadata* metadata);
+               TransactionMetadata* metadata,
+               bool* may_have_metadata);
 
   // Notifies transaction that specified ops were flushed with some status.
-  void Flushed(const internal::InFlightOps& ops, const Status& status);
+  void Flushed(
+      const internal::InFlightOps& ops, const ReadHybridTime& used_read_time, const Status& status);
 
   // Commits this transaction.
   void Commit(CommitCallback callback);
@@ -94,13 +105,21 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
   bool IsRestartRequired() const;
 
-  YBTransactionPtr CreateRestartedTransaction();
+  // Return true if there were operations executed with this transaction.
+  bool HasOperations() const;
+
+  // Creates restarted transaction, this transaction should be in the "restart required" state.
+  Result<YBTransactionPtr> CreateRestartedTransaction();
+
+  // Setup precreated transaction to be restarted version of this transaction.
+  CHECKED_STATUS FillRestartedTransaction(const YBTransactionPtr& dest);
 
   // Prepares child data, so child transaction could be started in another server.
   // Should be async because status tablet could be not ready yet.
-  void PrepareChild(PrepareChildCallback callback);
+  void PrepareChild(ForceConsistentRead force_consistent_read, PrepareChildCallback callback);
 
-  std::future<Result<ChildTransactionDataPB>> PrepareChildFuture();
+  std::future<Result<ChildTransactionDataPB>> PrepareChildFuture(
+      ForceConsistentRead force_consistent_read);
 
   // After we finish all child operations, we should finish child and send result to parent.
   Result<ChildTransactionResultPB> FinishChild();
@@ -110,6 +129,10 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   CHECKED_STATUS ApplyChildResult(const ChildTransactionResultPB& result);
 
   std::shared_future<TransactionMetadata> TEST_GetMetadata() const;
+
+  std::string ToString() const;
+
+  const IsolationLevel isolation() const;
 
  private:
   class Impl;

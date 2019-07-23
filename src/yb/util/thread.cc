@@ -49,6 +49,9 @@
 #include <set>
 #include <vector>
 
+#include <cds/init.h>
+#include <cds/gc/dhp.h>
+
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/mathlimits.h"
@@ -143,9 +146,13 @@ class ThreadMgr {
       : metrics_enabled_(false),
         threads_started_metric_(0),
         threads_running_metric_(0) {
+    cds::Initialize();
+    cds::gc::dhp::GarbageCollector::construct();
+    cds::threading::Manager::attachThread();
   }
 
   ~ThreadMgr() {
+    cds::Terminate();
     MutexLock l(lock_);
     thread_categories_.clear();
   }
@@ -314,20 +321,98 @@ void ThreadMgr::RemoveThread(const pthread_t& pthread_id, const string& category
   ANNOTATE_IGNORE_READS_AND_WRITES_END();
 }
 
-void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category,
-    stringstream* output) {
-  for (const ThreadCategory::value_type& thread : category) {
-    ThreadStats stats;
-    Status status = GetThreadStats(thread.second.thread_id(), &stats);
-    if (!status.ok()) {
-      YB_LOG_EVERY_N(INFO, 100) << "Could not get per-thread statistics: "
-                              << status.ToString();
+int Compare(const Result<StackTrace>& lhs, const Result<StackTrace>& rhs) {
+  if (lhs.ok()) {
+    if (!rhs.ok()) {
+      return -1;
     }
-    (*output) << "<tr><td>" << thread.second.name() << "</td><td>"
-              << (static_cast<double>(stats.user_ns) / 1e9) << "</td><td>"
-              << (static_cast<double>(stats.kernel_ns) / 1e9) << "</td><td>"
-              << (static_cast<double>(stats.iowait_ns) / 1e9) << "</td>"
-              << "<td><pre>" << DumpThreadStack(thread.second.thread_id()) << "</pre></td></tr>";
+    return lhs->compare(*rhs);
+  }
+  if (rhs.ok()) {
+    return 1;
+  }
+  return lhs.status().message().compare(rhs.status().message());
+
+}
+
+void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category, stringstream* output) {
+  struct ThreadData {
+    int64_t tid;
+    ThreadIdForStack tid_for_stack;
+    const std::string* name;
+    ThreadStats stats;
+    Result<StackTrace> stack_trace = StackTrace();
+    int rowspan = -1;
+  };
+  std::vector<ThreadData> threads;
+  std::vector<ThreadIdForStack> thread_ids;
+  threads.resize(category.size());
+  thread_ids.reserve(category.size());
+  {
+    auto* data = threads.data();
+    for (const ThreadCategory::value_type& thread : category) {
+      data->name = &thread.second.name();
+      data->tid = thread.second.thread_id();
+#if defined(__linux__)
+      data->tid_for_stack = data->tid;
+#else
+      data->tid_for_stack = thread.first;
+#endif
+      Status status = GetThreadStats(data->tid, &data->stats);
+      if (!status.ok()) {
+        YB_LOG_EVERY_N(INFO, 100) << "Could not get per-thread statistics: "
+                                  << status.ToString();
+      }
+      thread_ids.push_back(data->tid_for_stack);
+      ++data;
+    }
+  }
+
+  if (threads.empty()) {
+    return;
+  }
+
+  std::sort(thread_ids.begin(), thread_ids.end());
+  auto stacks = ThreadStacks(thread_ids);
+
+  for (ThreadData& data : threads) {
+    auto it = std::lower_bound(thread_ids.begin(), thread_ids.end(), data.tid_for_stack);
+    DCHECK(it != thread_ids.end() && *it == data.tid_for_stack);
+    data.stack_trace = stacks[it - thread_ids.begin()];
+  }
+
+  std::sort(threads.begin(), threads.end(), [](const ThreadData& lhs, const ThreadData& rhs) {
+    return Compare(lhs.stack_trace, rhs.stack_trace) < 0;
+  });
+
+  auto it = threads.begin();
+  auto first = it;
+  first->rowspan = 1;
+  while (++it != threads.end()) {
+    if (Compare(it->stack_trace, first->stack_trace) != 0) {
+      first = it;
+      first->rowspan = 1;
+    } else {
+      ++first->rowspan;
+    }
+  }
+
+  for (const auto& thread : threads) {
+    (*output)
+          << "<tr><td>" << *thread.name << "</td><td>"
+          << (static_cast<double>(thread.stats.user_ns) / 1e9) << "</td><td>"
+          << (static_cast<double>(thread.stats.kernel_ns) / 1e9) << "</td><td>"
+          << (static_cast<double>(thread.stats.iowait_ns) / 1e9) << "</td>";
+    if (thread.rowspan > 0) {
+      *output << Format("<td rowspan=\"$0\"><pre>", thread.rowspan);
+      if (thread.stack_trace.ok()) {
+        *output << thread.stack_trace->Symbolize();
+      } else {
+        *output << thread.stack_trace.status().message().ToBuffer();
+      }
+      *output << "</pre></td>";
+    }
+    *output << "</tr>\n";
   }
 }
 
@@ -429,24 +514,21 @@ Status StartThreadInstrumentation(const scoped_refptr<MetricEntity>& server_metr
 }
 
 ThreadJoiner::ThreadJoiner(Thread* thr)
-  : thread_(CHECK_NOTNULL(thr)),
-    warn_after_ms_(kDefaultWarnAfterMs),
-    warn_every_ms_(kDefaultWarnEveryMs),
-    give_up_after_ms_(kDefaultGiveUpAfterMs) {
+  : thread_(CHECK_NOTNULL(thr)) {
 }
 
-ThreadJoiner& ThreadJoiner::warn_after_ms(int ms) {
-  warn_after_ms_ = ms;
+ThreadJoiner& ThreadJoiner::warn_after(MonoDelta duration) {
+  warn_after_ = duration;
   return *this;
 }
 
-ThreadJoiner& ThreadJoiner::warn_every_ms(int ms) {
-  warn_every_ms_ = ms;
+ThreadJoiner& ThreadJoiner::warn_every(MonoDelta duration) {
+  warn_every_ = duration;
   return *this;
 }
 
-ThreadJoiner& ThreadJoiner::give_up_after_ms(int ms) {
-  give_up_after_ms_ = ms;
+ThreadJoiner& ThreadJoiner::give_up_after(MonoDelta duration) {
+  give_up_after_ = duration;
   return *this;
 }
 
@@ -461,31 +543,31 @@ Status ThreadJoiner::Join() {
     return Status::OK();
   }
 
-  int waited_ms = 0;
+  MonoDelta waited = MonoDelta::kZero;
   bool keep_trying = true;
   while (keep_trying) {
-    if (waited_ms >= warn_after_ms_) {
-      LOG(WARNING) << Substitute("Waited for $0ms trying to join with $1 (tid $2)",
-                                 waited_ms, thread_->name_, thread_->tid_);
+    if (waited >= warn_after_) {
+      LOG(WARNING) << Format("Waited for $0 trying to join with $1 (tid $2)",
+                             waited, thread_->name_, thread_->tid_);
     }
 
-    int remaining_before_giveup = MathLimits<int>::kMax;
-    if (give_up_after_ms_ != -1) {
-      remaining_before_giveup = give_up_after_ms_ - waited_ms;
+    auto remaining_before_giveup = give_up_after_;
+    if (remaining_before_giveup != MonoDelta::kMax) {
+      remaining_before_giveup -= waited;
     }
 
-    int remaining_before_next_warn = warn_every_ms_;
-    if (waited_ms < warn_after_ms_) {
-      remaining_before_next_warn = warn_after_ms_ - waited_ms;
+    auto remaining_before_next_warn = warn_every_;
+    if (waited < warn_after_) {
+      remaining_before_next_warn = warn_after_ - waited;
     }
 
     if (remaining_before_giveup < remaining_before_next_warn) {
       keep_trying = false;
     }
 
-    int wait_for = std::min(remaining_before_giveup, remaining_before_next_warn);
+    auto wait_for = std::min(remaining_before_giveup, remaining_before_next_warn);
 
-    if (thread_->done_.WaitFor(MonoDelta::FromMilliseconds(wait_for))) {
+    if (thread_->done_.WaitFor(wait_for)) {
       // Unconditionally join before returning, to guarantee that any TLS
       // has been destroyed (pthread_key_create() destructors only run
       // after a pthread's user method has returned).
@@ -494,10 +576,10 @@ Status ThreadJoiner::Join() {
       thread_->joinable_ = false;
       return Status::OK();
     }
-    waited_ms += wait_for;
+    waited += wait_for;
   }
-  return STATUS(Aborted, strings::Substitute("Timed out after $0ms joining on $1",
-                                             waited_ms, thread_->name_));
+
+  return STATUS_FORMAT(Aborted, "Timed out after $0 joining on $1", waited, thread_->name_);
 }
 
 Thread::~Thread() {
@@ -517,13 +599,13 @@ std::string Thread::ToString() const {
 }
 
 Status Thread::StartThread(const std::string& category, const std::string& name,
-                           const ThreadFunctor& functor, scoped_refptr<Thread> *holder) {
+                           ThreadFunctor functor, scoped_refptr<Thread> *holder) {
   InitThreading();
   const string log_prefix = Substitute("$0 ($1) ", name, category);
   SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "starting thread");
 
   // Temporary reference for the duration of this function.
-  scoped_refptr<Thread> t(new Thread(category, name, functor));
+  scoped_refptr<Thread> t(new Thread(category, name, std::move(functor)));
 
   {
     SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "creating pthread");
@@ -599,6 +681,8 @@ void* Thread::SuperviseThread(void* arg) {
   thread_manager->SetThreadName(name, t->tid());
   thread_manager->AddThread(pthread_self(), name, t->category(), t->tid());
 
+  cds::threading::Manager::attachThread();
+
   // FinishThread() is guaranteed to run (even if functor_ throws an
   // exception) because pthread_cleanup_push() creates a scoped object
   // whose destructor invokes the provided callback.
@@ -610,6 +694,8 @@ void* Thread::SuperviseThread(void* arg) {
 }
 
 void Thread::FinishThread(void* arg) {
+  cds::threading::Manager::detachThread();
+
   Thread* t = static_cast<Thread*>(arg);
 
   for (Closure& c : t->exit_callbacks_) {
@@ -627,6 +713,14 @@ void Thread::FinishThread(void* arg) {
 
   VLOG(2) << "Ended thread " << t->tid() << " - "
           << t->category() << ":" << t->name();
+}
+
+CDSAttacher::CDSAttacher() {
+  cds::threading::Manager::attachThread();
+}
+
+CDSAttacher::~CDSAttacher() {
+  cds::threading::Manager::detachThread();
 }
 
 } // namespace yb

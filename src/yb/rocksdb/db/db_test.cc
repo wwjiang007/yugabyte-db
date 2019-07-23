@@ -2014,10 +2014,9 @@ TEST_F(DBTest, RecoverWithLargeLog) {
 namespace {
 class KeepFilter : public CompactionFilter {
  public:
-  virtual bool Filter(int level, const Slice& key, const Slice& value,
-                      std::string* new_value, bool* value_changed) const
-      override {
-    return false;
+  FilterDecision Filter(int level, const Slice& key, const Slice& value,
+                        std::string* new_value, bool* value_changed) override {
+    return FilterDecision::kKeep;
   }
 
   const char* Name() const override { return "KeepFilter"; }
@@ -2046,11 +2045,11 @@ class KeepFilterFactory : public CompactionFilterFactory {
 class DelayFilter : public CompactionFilter {
  public:
   explicit DelayFilter(DBTestBase* d) : db_test(d) {}
-  virtual bool Filter(int level, const Slice& key, const Slice& value,
-                      std::string* new_value,
-                      bool* value_changed) const override {
+  FilterDecision Filter(int level, const Slice& key, const Slice& value,
+                        std::string* new_value,
+                        bool* value_changed) override {
     db_test->env_->addon_time_.fetch_add(1000);
-    return true;
+    return FilterDecision::kDiscard;
   }
 
   const char* Name() const override { return "DelayFilter"; }
@@ -4759,6 +4758,8 @@ class ModelDB: public DB {
 
   Env* GetEnv() const override { return nullptr; }
 
+  Env* GetCheckpointEnv() const override { return nullptr; }
+
   using DB::GetOptions;
   virtual const Options& GetOptions(
       ColumnFamilyHandle* column_family) const override {
@@ -6155,38 +6156,6 @@ TEST_F(DBTest, FlushOnDestroy) {
   CancelAllBackgroundWork(db_);
 }
 
-namespace {
-class OnFileDeletionListener : public EventListener {
- public:
-  OnFileDeletionListener() :
-      matched_count_(0),
-      expected_file_name_("") {}
-
-  void SetExpectedFileName(
-      const std::string file_name) {
-    expected_file_name_ = file_name;
-  }
-
-  void VerifyMatchedCount(size_t expected_value) {
-    ASSERT_EQ(matched_count_, expected_value);
-  }
-
-  void OnTableFileDeleted(
-      const TableFileDeletionInfo& info) override {
-    if (expected_file_name_ != "") {
-      ASSERT_EQ(expected_file_name_, info.file_path);
-      expected_file_name_ = "";
-      matched_count_++;
-    }
-  }
-
- private:
-  size_t matched_count_;
-  std::string expected_file_name_;
-};
-
-}  // namespace
-
 TEST_F(DBTest, DynamicLevelCompressionPerLevel) {
   if (!Snappy_Supported()) {
     return;
@@ -6749,6 +6718,53 @@ TEST_F(DBTest, DontDeletePendingOutputs) {
   // db/db_test.cc:975: IO error:
   // /tmp/rocksdbtest-1552237650/db_test/000009.sst: No such file or directory
   Compact("a", "b");
+}
+
+TEST_F(DBTest, DontDeletePendingOutputsDuringConcurrentFlushes) {
+  const auto kConcurrentFlushes = 4;
+  const auto kFlushIterationsPerThread = 300;
+
+  Options options;
+  options.env = env_;
+  options.create_if_missing = true;
+  options.max_background_flushes = kConcurrentFlushes;
+
+  DestroyAndReopen(options);
+
+  std::atomic<bool> stop_requested(false);
+
+  std::vector<std::thread> flush_threads;
+
+  auto purge_thread = std::thread([this, &stop_requested] {
+    LOG(INFO) << "Started purge thread";
+    while (!stop_requested) {
+      JobContext job_context(0);
+      dbfull()->TEST_LockMutex();
+      dbfull()->FindObsoleteFiles(&job_context, true /*force*/);
+      dbfull()->TEST_UnlockMutex();
+      if (job_context.HaveSomethingToDelete()) {
+        dbfull()->PurgeObsoleteFiles(job_context);
+      }
+      job_context.Clean();
+    }
+  });
+
+  for (int i = 0; i < kConcurrentFlushes; ++i) {
+    flush_threads.emplace_back([this] {
+      for (int iter = 0; iter < kFlushIterationsPerThread; ++iter) {
+        ASSERT_OK(Put("a", "begin"));
+        ASSERT_OK(Put("z", "end"));
+        ASSERT_OK(Flush());
+      }
+    });
+  }
+
+  for (auto& thread : flush_threads) {
+    thread.join();
+  }
+
+  stop_requested = true;
+  purge_thread.join();
 }
 
 #ifndef ROCKSDB_LITE

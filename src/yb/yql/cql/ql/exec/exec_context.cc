@@ -16,7 +16,9 @@
 #include "yb/yql/cql/ql/exec/exec_context.h"
 #include "yb/yql/cql/ql/ptree/pt_select.h"
 #include "yb/client/callbacks.h"
+#include "yb/client/table.h"
 #include "yb/client/yb_op.h"
+#include "yb/rpc/thread_pool.h"
 #include "yb/util/trace.h"
 
 namespace yb {
@@ -24,6 +26,7 @@ namespace ql {
 
 using client::CommitCallback;
 using client::Restart;
+using client::YBqlReadOpPtr;
 using client::YBSessionPtr;
 using client::YBTransactionPtr;
 
@@ -33,7 +36,10 @@ ExecContext::ExecContext(const ParseTree& parse_tree, const StatementParameters&
 
 ExecContext::~ExecContext() {
   // Reset to abort transaction explicitly instead of letting it expire.
-  Reset(client::Restart::kFalse);
+  // Should be ok not to take a rescheduler here since the `ExecContext` clean up should happen
+  // only when we return a response to the CQL client, which is now guaranteed to happen in
+  // CQL proxy's handler thread.
+  Reset(client::Restart::kFalse, nullptr);
 }
 
 TnodeContext* ExecContext::AddTnode(const TreeNode *tnode) {
@@ -43,19 +49,19 @@ TnodeContext* ExecContext::AddTnode(const TreeNode *tnode) {
 }
 
 //--------------------------------------------------------------------------------------------------
-void ExecContext::StartTransaction(const IsolationLevel isolation_level, QLEnv* ql_env) {
+Status ExecContext::StartTransaction(const IsolationLevel isolation_level, QLEnv* ql_env) {
   TRACE("Start Transaction");
   transaction_start_time_ = MonoTime::Now();
   if (!transaction_) {
-    transaction_ = ql_env->NewTransaction(transaction_, isolation_level);
+    transaction_ = VERIFY_RESULT(ql_env->NewTransaction(transaction_, isolation_level));
   } else if (transaction_->IsRestartRequired()) {
-    transaction_ = transaction_->CreateRestartedTransaction();
+    transaction_ = VERIFY_RESULT(transaction_->CreateRestartedTransaction());
   } else {
     // If there is no need to start or restart transaction, just return. This can happen to DMLs on
     // a table with secondary index inside a "BEGIN TRANSACTION ... END TRANSACTION" block. Each DML
     // will try to start a transaction "on-demand" and we will use the shared transaction already
     // started by "BEGIN TRANSACTION".
-    return;
+    return Status::OK();
   }
 
   if (!transactional_session_) {
@@ -63,11 +69,14 @@ void ExecContext::StartTransaction(const IsolationLevel isolation_level, QLEnv* 
     transactional_session_->SetReadPoint(client::Restart::kFalse);
   }
   transactional_session_->SetTransaction(transaction_);
+
+  return Status::OK();
 }
 
 Status ExecContext::PrepareChildTransaction(ChildTransactionDataPB* data) {
   ChildTransactionDataPB result =
-      VERIFY_RESULT(DCHECK_NOTNULL(transaction_.get())->PrepareChildFuture().get());
+      VERIFY_RESULT(DCHECK_NOTNULL(transaction_.get())->PrepareChildFuture(
+          client::ForceConsistentRead::kTrue).get());
   *data = std::move(result);
   return Status::OK();
 }
@@ -119,8 +128,29 @@ bool ExecContext::HasPendingOperations() const {
   return false;
 }
 
+class AbortTransactionTask : public rpc::ThreadPoolTask {
+ public:
+  explicit AbortTransactionTask(YBTransactionPtr transaction)
+      : transaction_(std::move(transaction)) {}
+
+  void Run() override {
+    transaction_->Abort();
+    transaction_ = nullptr;
+  }
+
+  void Done(const Status& status) override {
+    delete this;
+  }
+
+  virtual ~AbortTransactionTask() {
+  }
+
+ private:
+  YBTransactionPtr transaction_;
+};
+
 //--------------------------------------------------------------------------------------------------
-void ExecContext::Reset(const Restart restart) {
+void ExecContext::Reset(const Restart restart, Rescheduler* rescheduler) {
   if (transactional_session_) {
     transactional_session_->Abort();
     transactional_session_->SetTransaction(nullptr);
@@ -128,7 +158,11 @@ void ExecContext::Reset(const Restart restart) {
   if (transaction_ && !(transaction_->IsRestartRequired() && restart)) {
     YBTransactionPtr transaction = std::move(transaction_);
     TRACE("Abort Transaction");
-    transaction->Abort();
+    if (rescheduler && rescheduler->NeedReschedule()) {
+      rescheduler->Reschedule(new AbortTransactionTask(std::move(transaction)));
+    } else {
+      transaction->Abort();
+    }
   }
   restart_ = restart;
   tnode_contexts_.clear();
@@ -139,6 +173,18 @@ void ExecContext::Reset(const Restart restart) {
 
 //--------------------------------------------------------------------------------------------------
 TnodeContext::TnodeContext(const TreeNode* tnode) : tnode_(tnode), start_time_(MonoTime::Now()) {
+}
+
+Status TnodeContext::AppendRowsResult(RowsResult::SharedPtr&& rows_result) {
+  if (!rows_result) {
+    return Status::OK();
+  }
+  row_count_ += VERIFY_RESULT(QLRowBlock::GetRowCount(YQL_CLIENT_CQL, rows_result->rows_data()));
+  if (rows_result_ == nullptr) {
+    rows_result_ = std::move(rows_result);
+    return Status::OK();
+  }
+  return rows_result_->Append(std::move(*rows_result));
 }
 
 void TnodeContext::InitializePartition(QLReadRequestPB *req, uint64_t start_partition) {
@@ -203,7 +249,21 @@ bool TnodeContext::HasPendingOperations() const {
       return true;
     }
   }
+  if (child_context_) {
+    return child_context_->HasPendingOperations();
+  }
   return false;
+}
+
+void TnodeContext::SetUncoveredSelectOp(const YBqlReadOpPtr& select_op) {
+  uncovered_select_op_ = select_op;
+  const Schema& schema = static_cast<const PTSelectStmt*>(tnode_)->table()->InternalSchema();
+  std::vector<ColumnId> key_column_ids;
+  key_column_ids.reserve(schema.num_key_columns());
+  for (size_t idx = 0; idx < schema.num_key_columns(); idx++) {
+    key_column_ids.emplace_back(schema.column_id(idx));
+  }
+  keys_ = std::make_unique<QLRowBlock>(schema, key_column_ids);
 }
 
 }  // namespace ql

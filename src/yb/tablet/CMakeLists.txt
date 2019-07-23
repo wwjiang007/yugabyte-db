@@ -44,12 +44,13 @@ set(TABLET_SRCS
   transaction_participant.cc
   operation_order_verifier.cc
   operations/operation.cc
-  operations/alter_schema_operation.cc
+  operations/change_metadata_operation.cc
   operations/operation_driver.cc
   operations/operation_tracker.cc
   operations/truncate_operation.cc
   operations/update_txn_operation.cc
   operations/write_operation.cc
+  operations/snapshot_operation.cc
   lock_manager.cc
   maintenance_manager.cc
   mvcc.cc
@@ -99,6 +100,7 @@ target_link_libraries(tablet_test_util tablet yb_common yb_test_util yb_util)
 
 set(YB_TEST_LINK_LIBS tablet tablet_test_util ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(tablet-test)
+ADD_YB_TEST(tablet-split-test)
 ADD_YB_TEST(tablet-metadata-test)
 ADD_YB_TEST(verifyrows-tablet-test)
 ADD_YB_TEST(tablet-pushdown-test)

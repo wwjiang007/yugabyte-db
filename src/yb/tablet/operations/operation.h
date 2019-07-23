@@ -40,7 +40,9 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/opid_util.h"
 #include "yb/util/auto_release_pool.h"
 #include "yb/util/locks.h"
 #include "yb/util/status.h"
@@ -55,7 +57,7 @@ class OperationCompletionCallback;
 class OperationState;
 
 YB_DEFINE_ENUM(OperationType,
-               (kWrite)(kAlterSchema)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty));
+               (kWrite)(kChangeMetadata)(kUpdateTransaction)(kSnapshot)(kTruncate)(kEmpty));
 
 // Base class for transactions.  There are different implementations for different types (Write,
 // AlterSchema, etc.) OperationDriver implementations use Operations along with Consensus to execute
@@ -73,15 +75,11 @@ class Operation {
   };
 
   Operation(std::unique_ptr<OperationState> state,
-            consensus::DriverType type,
             OperationType operation_type);
 
   // Returns the OperationState for this transaction.
   virtual OperationState* state() { return state_.get(); }
   virtual const OperationState* state() const { return state_.get(); }
-
-  // Returns whether this transaction is being executed on the leader or on a replica.
-  consensus::DriverType type() const { return type_; }
 
   // Returns this transaction's type.
   OperationType operation_type() const { return operation_type_; }
@@ -105,12 +103,7 @@ class Operation {
 
   // Executes the Apply() phase of the transaction, the actual actions of this phase depend on the
   // transaction type, but usually this is the method where data-structures are changed.
-  virtual CHECKED_STATUS Apply() = 0;
-
-  // Executed after Apply() but before the commit is submitted to consensus.  Some transactions use
-  // this to perform pre-commit actions (e.g. write transactions perform early lock release on this
-  // hook).  Default implementation does nothing.
-  virtual void PreCommit() {}
+  virtual CHECKED_STATUS Apply(int64_t leader_term) = 0;
 
   // Executed after the transaction has been applied and the commit message has been appended to the
   // log (though it might not be durable yet), or if the transaction was aborted.  Implementations
@@ -132,7 +125,6 @@ class Operation {
   // A private version of this transaction's transaction state so that we can use base
   // OperationState methods on destructors.
   std::unique_ptr<OperationState> state_;
-  const consensus::DriverType type_;
   const OperationType operation_type_;
 };
 
@@ -147,11 +139,7 @@ class OperationState {
 
   // Sets the ConsensusRound for this transaction, if this transaction is being executed through the
   // consensus system.
-  void set_consensus_round(const scoped_refptr<consensus::ConsensusRound>& consensus_round) {
-    consensus_round_ = consensus_round;
-    op_id_ = consensus_round_->id();
-    UpdateRequestFromConsensusRound();
-  }
+  void set_consensus_round(const scoped_refptr<consensus::ConsensusRound>& consensus_round);
 
   // Each subclass should provide a way to update the internal reference to the Message* request, so
   // we can avoid copying the request object all the time.
@@ -169,11 +157,6 @@ class OperationState {
 
   void set_completion_callback(std::unique_ptr<OperationCompletionCallback> completion_clbk) {
     completion_clbk_ = std::move(completion_clbk);
-  }
-
-  // Returns the completion callback.
-  OperationCompletionCallback* completion_callback() {
-    return DCHECK_NOTNULL(completion_clbk_.get());
   }
 
   // Sets a heap object to be managed by this transaction's AutoReleasePool.
@@ -226,6 +209,13 @@ class OperationState {
     return op_id_;
   }
 
+  bool has_completion_callback() const {
+    return completion_clbk_ != nullptr;
+  }
+
+  void CompleteWithStatus(const Status& status) const;
+  void SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const;
+
   virtual ~OperationState();
 
  protected:
@@ -243,7 +233,7 @@ class OperationState {
   HybridTime hybrid_time_;
 
   // The clock error when hybrid_time_ was read.
-  uint64_t hybrid_time_error_;
+  uint64_t hybrid_time_error_ = 0;
 
   boost::optional<Arena> arena_;
 
@@ -282,7 +272,7 @@ class OperationCompletionCallback {
   const tserver::TabletServerErrorPB::Code error_code() const;
 
   // Subclasses should override this.
-  virtual void OperationCompleted();
+  virtual void OperationCompleted() = 0;
 
   void CompleteWithStatus(const Status& status) {
     set_error(status);
@@ -319,6 +309,19 @@ class LatchOperationCompletionCallback : public OperationCompletionCallback {
  private:
   CountDownLatch* latch_;
   ResponsePB* response_;
+};
+
+class SynchronizerOperationCompletionCallback : public OperationCompletionCallback {
+ public:
+  explicit SynchronizerOperationCompletionCallback(Synchronizer* synchronizer)
+    : synchronizer_(DCHECK_NOTNULL(synchronizer)) {}
+
+  void OperationCompleted() override {
+    synchronizer_->StatusCB(status());
+  }
+
+ private:
+  Synchronizer* synchronizer_;
 };
 
 }  // namespace tablet

@@ -52,6 +52,8 @@ message RedisReadRequestPB {
     RedisGetRangeRequestPB get_range_request = 5;
     RedisCollectionGetRangeRequestPB get_collection_range_request = 9;
     RedisGetTtlRequestPB get_ttl_request = 11;
+    RedisKeysRequestPB keys_request = 12;
+    RedisGetForRenameRequestPB get_for_rename_request = 13;
   }
 
   optional RedisKeyValuePB key_value = 6;
@@ -234,7 +236,17 @@ message RedisSetTtlRequestPB {
 // TTL, PTTL
 message RedisGetTtlRequestPB {
   // By default, the return value is in milliseconds.
-  optional bool return_seconds = 1 [ default = false ];
+  optional bool return_seconds = 1 [default = false];
+}
+
+// KEYS
+message RedisKeysRequestPB {
+  optional string pattern = 1;
+  optional int32 threshold = 2;
+}
+
+// RENAME
+message RedisGetForRenameRequestPB {
 }
 
 // GETSET
@@ -325,9 +337,11 @@ message RedisResponsePB {
     bytes string_response = 3;
     RedisArrayPB array_response = 4;
     bytes status_response = 5;
+    bytes encoded_response = 7;
   }
 
   optional bytes error_message = 6;
+  optional RedisDataType type = 8;
 }
 
 message RedisArrayPB {

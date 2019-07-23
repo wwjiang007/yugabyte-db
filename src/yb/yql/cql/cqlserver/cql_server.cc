@@ -21,17 +21,17 @@
 #include "yb/rpc/messenger.h"
 
 using yb::rpc::ServiceIf;
-using namespace yb::size_literals;
+using namespace yb::size_literals;  // NOLINT.
 
-DEFINE_int32(cql_service_queue_length, 1000,
+DEFINE_int32(cql_service_queue_length, 10000,
              "RPC queue length for CQL service");
 TAG_FLAG(cql_service_queue_length, advanced);
 
-DEFINE_int32(cql_nodelist_refresh_interval_secs, 60,
+DEFINE_int32(cql_nodelist_refresh_interval_secs, 300,
              "Interval after which a node list refresh event should be sent to all CQL clients.");
+TAG_FLAG(cql_nodelist_refresh_interval_secs, runtime);
 TAG_FLAG(cql_nodelist_refresh_interval_secs, advanced);
 
-DEFINE_int64(cql_rpc_block_size, 1_MB, "CQL RPC block size");
 DEFINE_int64(cql_rpc_memory_limit, 0, "CQL RPC memory limit");
 
 using namespace std::placeholders;
@@ -54,13 +54,14 @@ CQLServer::CQLServer(const CQLServerOptions& opts,
     : RpcAndWebServerBase(
           "CQLServer", opts, "yb.cqlserver",
           MemTracker::CreateTracker(
-              "CQL", tserver ? tserver->mem_tracker() : MemTracker::GetRootTracker())),
+              "CQL", tserver ? tserver->mem_tracker() : MemTracker::GetRootTracker(),
+              AddToParent::kTrue, CreateMetrics::kFalse)),
       opts_(opts),
       timer_(*io, refresh_interval()),
       tserver_(tserver),
       local_tablet_filter_(std::move(local_tablet_filter)) {
   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<CQLConnectionContext>(
-      FLAGS_cql_rpc_block_size, FLAGS_cql_rpc_memory_limit, mem_tracker()->parent()));
+      FLAGS_cql_rpc_memory_limit, mem_tracker()->parent()));
 }
 
 Status CQLServer::Start() {
@@ -149,7 +150,7 @@ void CQLServer::CQLNodeListRefresh(const boost::system::error_code &e) {
     cqlserver_event_list->AddEvent(
         BuildTopologyChangeEvent(TopologyChangeEventResponse::kMovedNode, first_rpc_address()));
 
-    Status s = messenger_->QueueEventOnAllReactors(cqlserver_event_list);
+    Status s = messenger_->QueueEventOnAllReactors(cqlserver_event_list, SOURCE_LOCATION());
     if (!s.ok()) {
       LOG (WARNING) << strings::Substitute("Failed to push events: [$0], due to: $1",
                                            cqlserver_event_list->ToString(), s.ToString());

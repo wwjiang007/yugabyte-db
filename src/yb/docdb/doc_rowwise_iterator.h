@@ -28,6 +28,7 @@
 #include "yb/docdb/doc_ql_scanspec.h"
 #include "yb/docdb/doc_pgsql_scanspec.h"
 #include "yb/docdb/value.h"
+#include "yb/docdb/deadline_info.h"
 #include "yb/util/status.h"
 #include "yb/util/pending_op_counter.h"
 
@@ -35,6 +36,7 @@ namespace yb {
 namespace docdb {
 
 class IntentAwareIterator;
+class ScanChoices;
 
 // An SQL-mapped-to-document-DB iterator.
 class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
@@ -43,7 +45,7 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
                      const Schema &schema,
                      const TransactionOperationContextOpt& txn_op_context,
                      const DocDB& doc_db,
-                     MonoTime deadline,
+                     CoarseTimePoint deadline,
                      const ReadHybridTime& read_time,
                      yb::util::PendingOperationCounter* pending_op_counter = nullptr);
 
@@ -51,12 +53,12 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
                      const Schema &schema,
                      const TransactionOperationContextOpt& txn_op_context,
                      const DocDB& doc_db,
-                     MonoTime deadline,
+                     CoarseTimePoint deadline,
                      const ReadHybridTime& read_time,
                      yb::util::PendingOperationCounter* pending_op_counter = nullptr)
       : DocRowwiseIterator(
-          *projection, schema, txn_op_context, doc_db, deadline, read_time,
-          pending_op_counter) {
+            *projection, schema, txn_op_context, doc_db, deadline, read_time,
+            pending_op_counter) {
     projection_owner_ = std::move(projection);
   }
 
@@ -72,7 +74,7 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
   // This must always be called before NextRow. The implementation actually finds the
   // first row to scan, and NextRow expects the RocksDB iterator to already be properly
   // positioned.
-  bool HasNext() const override;
+  Result<bool> HasNext() const override;
 
   std::string ToString() const override;
 
@@ -84,11 +86,7 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
   // Is the next row to read a row with a static column?
   bool IsNextStaticColumn() const override;
 
-  CHECKED_STATUS SetPagingStateIfNecessary(const QLReadRequestPB& request,
-                                           const size_t num_rows_skipped,
-                                           QLResponsePB* response) const override;
-
-  const DocKey& row_key() const {
+  const Slice& row_key() const {
     return row_key_;
   }
 
@@ -101,10 +99,27 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
 
   HybridTime RestartReadHt() override;
 
- private:
+  // Returns the tuple id of the current tuple. The tuple id returned is the serialized DocKey
+  // and without the cotable id.
+  Result<Slice> GetTupleId() const override;
+
+  // Seeks to the given tuple by its id. The tuple id should be the serialized DocKey and without
+  // the cotable id.
+  Result<bool> SeekTuple(const Slice& tuple_id) override;
 
   // Retrieves the next key to read after the iterator finishes for the given page.
-  CHECKED_STATUS GetNextReadSubDocKey(SubDocKey* sub_doc_key) const;
+  CHECKED_STATUS GetNextReadSubDocKey(SubDocKey* sub_doc_key) const override;
+
+ private:
+  template <class T>
+  CHECKED_STATUS DoInit(const T& spec);
+
+  Result<bool> InitScanChoices(
+      const DocQLScanSpec& doc_spec, const KeyBytes& lower_doc_key, const KeyBytes& upper_doc_key);
+
+  Result<bool> InitScanChoices(
+      const DocPgsqlScanSpec& doc_spec, const KeyBytes& lower_doc_key,
+      const KeyBytes& upper_doc_key);
 
   // Get the non-key column values of a QL row.
   CHECKED_STATUS GetValues(const Schema& projection, vector<SubDocument>* values);
@@ -137,44 +152,10 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
   // For reverse scans, moves the iterator to the first kv-pair of the previous row after having
   // constructed the current row. For forward scans nothing is necessary because GetSubDocument
   // ensures that the iterator will be positioned on the first kv-pair of the next row.
-  CHECKED_STATUS EnsureIteratorPositionCorrect() const;
+  CHECKED_STATUS AdvanceIteratorToNextDesiredRow() const;
 
   // Read next row into a value map using the specified projection.
   CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) override;
-
-  // Returns true if this is a (multi)key scan (as opposed to an e.g. sequential scan).
-  // It means we have a (non-empty) list of target keys that we will seek for in order (or reverse
-  // order for reverse scans).
-  bool IsMultiKeyScan() const {
-    return range_cols_scan_options_ != nullptr;
-  }
-
-  // Utility function for (multi)key scans. Returns false if there are still target keys we need
-  // to scan, and true if we are done.
-  bool FinishedScanTargetsList() const {
-    // We clear the options indexes array when we finished traversing all scan target options.
-    return current_scan_target_idxs_.empty();
-  }
-
-  // Utility function for (multi)key scans. Updates the target scan key by incrementing the option
-  // index for one column. Will handle overflow by setting current column index to 0 and
-  // incrementing the previous column instead. If it overflows at first column it means we are done,
-  // so it clears the scan target idxs array.
-  void IncrementScanTargetAtColumn(size_t start_col) const;
-
-  // Utility function for (multi)key scans to initialize the range portion of the current scan
-  // target, scan target with the first option.
-  // Only needed for scans that include the static row, otherwise Init will take care of this.
-  bool InitScanTargetRangeGroupIfNeeded() const;
-
-  // For a (multi)key scan, go to the next scan target if any. Otherwise clear the scan target idxs
-  // array to mark that we are done.
-  void GoToNextScanTarget() const;
-
-  // For a (multi)key scan, go (directly) to the new target (or the one after if new_target does not
-  // exist in the target list). If the new_target is larger than all scan target options it means we
-  // are done so it cleares the scan target idxs array.
-  void GoToScanTarget(const DocKey &new_target) const;
 
   const Schema& projection_;
   // Used to maintain ownership of projection_.
@@ -188,7 +169,7 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
 
   bool is_forward_scan_ = true;
 
-  const MonoTime deadline_;
+  const CoarseTimePoint deadline_;
 
   const ReadHybridTime read_time_;
 
@@ -198,23 +179,9 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
   // reaches this point. This is exclusive bound for forward scans and inclusive bound for
   // reverse scans.
   bool has_bound_key_;
-  DocKey bound_key_;
+  KeyBytes bound_key_;
 
-  // TODO (mihnea) refactor this logic into a separate class for iterating through options.
-  // For (multi)key scans (e.g. selects with 'IN' condition on the range columns) we hold the
-  // options for each range column as we iteratively seek to each target key.
-  // e.g. for a query "h = 1 and r1 in (2,3) and r2 in (4,5) and r3 = 6":
-  //  range_cols_scan_options_   [[2, 3], [4, 5], [6]] -- value options for each column.
-  //  current_scan_target_idxs_  goes from [0, 0, 0] up to [1, 1, 0] -- except when including the
-  //                             static row when it starts from [0, 0, -1] instead.
-  //  current_scan_target_       goes from [1][2,4,6] up to [1][3,5,6] -- is the doc key containing,
-  //                             for each range column, the value (option) referenced by the
-  //                             corresponding index (updated along with current_scan_target_idxs_).
-  std::shared_ptr<std::vector<std::vector<PrimitiveValue>>> range_cols_scan_options_;
-  mutable std::vector<std::vector<PrimitiveValue>::const_iterator> current_scan_target_idxs_;
-  mutable DocKey current_scan_target_;
-
-
+  std::unique_ptr<ScanChoices> scan_choices_;
   std::unique_ptr<IntentAwareIterator> db_iter_;
 
   // We keep the "pending operation" counter incremented for the lifetime of this iterator so that
@@ -230,7 +197,10 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
   mutable SubDocument row_;
 
   // The current row's primary key. It is set to lower bound in the beginning.
-  mutable DocKey row_key_;
+  mutable Slice row_key_;
+
+  // The current row's hash part of primary key.
+  mutable Slice row_hash_key_;
 
   // The current row's iterator key.
   mutable KeyBytes iter_key_;
@@ -242,8 +212,13 @@ class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
 
   mutable std::vector<PrimitiveValue> projection_subkeys_;
 
-  // Used for keeping track of errors that happen in HasNext. Returned
-  mutable Status status_;
+  // Used for keeping track of errors in HasNext.
+  mutable Status has_next_status_;
+
+  mutable boost::optional<DeadlineInfo> deadline_info_;
+
+  // Key for seeking a YSQL tuple. Used only when the table has a cotable id.
+  boost::optional<KeyBytes> tuple_key_;
 };
 
 }  // namespace docdb

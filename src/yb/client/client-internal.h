@@ -42,12 +42,14 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/index.h"
 #include "yb/common/wire_protocol.h"
+#include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc.h"
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/util/atomic.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/strongly_typed_uuid.h"
 #include "yb/util/threadpool.h"
 
 namespace yb {
@@ -87,68 +89,74 @@ class YBClient::Data {
   CHECKED_STATUS CreateTable(YBClient* client,
                              const master::CreateTableRequestPB& req,
                              const YBSchema& schema,
-                             const MonoTime& deadline);
+                             CoarseTimePoint deadline,
+                             std::string* table_id);
 
   CHECKED_STATUS IsCreateTableInProgress(YBClient* client,
                                          const YBTableName& table_name,
-                                         const MonoTime& deadline,
+                                         const std::string& table_id,
+                                         CoarseTimePoint deadline,
                                          bool *create_in_progress);
 
   CHECKED_STATUS WaitForCreateTableToFinish(YBClient* client,
                                             const YBTableName& table_name,
-                                            const MonoTime& deadline);
+                                            const std::string& table_id,
+                                            CoarseTimePoint deadline);
 
   CHECKED_STATUS DeleteTable(YBClient* client,
                              const YBTableName& table_name,
+                             const std::string& table_id,
                              bool is_index_table,
-                             const MonoTime& deadline,
+                             CoarseTimePoint deadline,
                              YBTableName* indexed_table_name,
                              bool wait = true);
 
   CHECKED_STATUS IsDeleteTableInProgress(YBClient* client,
-                                         const std::string& deleted_table_id,
-                                         const MonoTime& deadline,
+                                         const std::string& table_id,
+                                         CoarseTimePoint deadline,
                                          bool *delete_in_progress);
 
   CHECKED_STATUS WaitForDeleteTableToFinish(YBClient* client,
-                                            const std::string& deleted_table_id,
-                                            const MonoTime& deadline);
+                                            const std::string& table_id,
+                                            CoarseTimePoint deadline);
 
   CHECKED_STATUS TruncateTables(YBClient* client,
                                 const std::vector<std::string>& table_ids,
-                                const MonoTime& deadline,
+                                CoarseTimePoint deadline,
                                 bool wait = true);
 
   CHECKED_STATUS IsTruncateTableInProgress(YBClient* client,
                                            const std::string& table_id,
-                                           const MonoTime& deadline,
+                                           CoarseTimePoint deadline,
                                            bool *truncate_in_progress);
 
   CHECKED_STATUS WaitForTruncateTableToFinish(YBClient* client,
                                               const std::string& table_id,
-                                              const MonoTime& deadline);
+                                              CoarseTimePoint deadline);
 
   CHECKED_STATUS AlterTable(YBClient* client,
                             const master::AlterTableRequestPB& req,
-                            const MonoTime& deadline);
+                            CoarseTimePoint deadline);
 
   CHECKED_STATUS IsAlterTableInProgress(YBClient* client,
                                         const YBTableName& table_name,
-                                        const MonoTime& deadline,
+                                        string table_id,
+                                        CoarseTimePoint deadline,
                                         bool *alter_in_progress);
 
   CHECKED_STATUS WaitForAlterTableToFinish(YBClient* client,
                                            const YBTableName& alter_name,
-                                           const MonoTime& deadline);
+                                           string table_id,
+                                           CoarseTimePoint deadline);
 
   CHECKED_STATUS GetTableSchema(YBClient* client,
                                 const YBTableName& table_name,
-                                const MonoTime& deadline,
-                                YBTable::Info* info);
+                                CoarseTimePoint deadline,
+                                YBTableInfo* info);
   CHECKED_STATUS GetTableSchema(YBClient* client,
                                 const TableId& table_id,
-                                const MonoTime& deadline,
-                                YBTable::Info* info);
+                                CoarseTimePoint deadline,
+                                YBTableInfo* info);
 
   CHECKED_STATUS InitLocalHostNames();
 
@@ -187,7 +195,7 @@ class YBClient::Data {
   //
   // Works with both a distributed and non-distributed configuration.
   void SetMasterServerProxyAsync(YBClient* client,
-                                 const MonoTime& deadline,
+                                 CoarseTimePoint deadline,
                                  bool skip_resolution,
                                  const StatusCallback& cb);
 
@@ -199,7 +207,7 @@ class YBClient::Data {
   // TODO (KUDU-492): Get rid of this method and re-factor the client
   // to lazily initialize 'master_proxy_'.
   CHECKED_STATUS SetMasterServerProxy(YBClient* client,
-                                      const MonoTime& deadline,
+                                      CoarseTimePoint deadline,
                                       bool skip_resolution = false);
 
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const;
@@ -222,7 +230,7 @@ class YBClient::Data {
   // retry. It is otherwise used in a RetryFunc to indicate if to keep retrying or not, if we get a
   // version mismatch on setting the config.
   CHECKED_STATUS SetReplicationInfo(
-      YBClient* client, const master::ReplicationInfoPB& replication_info, const MonoTime& deadline,
+      YBClient* client, const master::ReplicationInfoPB& replication_info, CoarseTimePoint deadline,
       bool* retry = nullptr);
 
   // Retry 'func' until either:
@@ -241,12 +249,13 @@ class YBClient::Data {
   // the resulting Status.
   template <class ReqClass, class RespClass>
   CHECKED_STATUS SyncLeaderMasterRpc(
-      const MonoTime& deadline, YBClient* client, const ReqClass& req, RespClass* resp,
+      CoarseTimePoint deadline, YBClient* client, const ReqClass& req, RespClass* resp,
       int* num_attempts, const char* func_name,
       const std::function<Status(
           master::MasterServiceProxy*, const ReqClass&, RespClass*, rpc::RpcController*)>& func);
 
-  std::shared_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
+  std::unique_ptr<rpc::Messenger> messenger_holder_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
   gscoped_ptr<DnsResolver> dns_resolver_;
   scoped_refptr<internal::MetaCache> meta_cache_;
@@ -301,6 +310,18 @@ class YBClient::Data {
 
   std::unique_ptr<ThreadPool> cb_threadpool_;
 
+  const ClientId id_;
+
+  // Used to track requests that were sent to a particular tablet, so it could track different
+  // RPCs related to the same write operation and reject duplicates.
+  struct TabletRequests {
+    RetryableRequestId request_id_seq = 0;
+    std::set<RetryableRequestId> running_requests;
+  };
+
+  simple_spinlock tablet_requests_mutex_;
+  std::unordered_map<TabletId, TabletRequests> tablet_requests_;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(Data);
 };
@@ -312,8 +333,8 @@ class YBClient::Data {
 // returned to the caller, otherwise a Status::Timeout() will be returned.
 // If the deadline is already expired, no attempt will be made.
 Status RetryFunc(
-    const MonoTime& deadline, const std::string& retry_msg, const std::string& timeout_msg,
-    const std::function<Status(const MonoTime&, bool*)>& func);
+    CoarseTimePoint deadline, const std::string& retry_msg, const std::string& timeout_msg,
+    const std::function<Status(CoarseTimePoint, bool*)>& func);
 
 } // namespace client
 } // namespace yb

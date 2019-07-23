@@ -24,6 +24,7 @@
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
 #include "yb/yql/cql/ql/ptree/pt_alter_table.h"
 #include "yb/yql/cql/ql/ptree/pt_create_type.h"
+#include "yb/yql/cql/ql/ptree/pt_create_index.h"
 #include "yb/yql/cql/ql/ptree/sem_state.h"
 
 namespace yb {
@@ -96,6 +97,7 @@ class SemContext : public ProcessContext {
   CHECKED_STATUS LookupTable(const client::YBTableName& name,
                              const YBLocation& loc,
                              bool write_table,
+                             const PermissionType permission_type,
                              std::shared_ptr<client::YBTable>* table,
                              bool* is_system,
                              MCVector<ColumnDesc>* col_descs = nullptr,
@@ -123,6 +125,16 @@ class SemContext : public ProcessContext {
 
   void set_current_create_table_stmt(PTCreateTable *table) {
     current_processing_id_.create_table_ = table;
+  }
+
+  PTCreateIndex *current_create_index_stmt() {
+    PTCreateTable* const table = current_create_table_stmt();
+    return (table != nullptr && table->opcode() == TreeNodeOpcode::kPTCreateIndex)
+        ? static_cast<PTCreateIndex*>(table) : nullptr;
+  }
+
+  void set_current_create_index_stmt(PTCreateIndex *index) {
+    set_current_create_table_stmt(index);
   }
 
   PTAlterTable *current_alter_table() {
@@ -163,7 +175,7 @@ class SemContext : public ProcessContext {
 
   // Find column descriptor from symbol table. From the context, the column value will be marked to
   // be read if necessary when executing the QL statement.
-  const ColumnDesc *GetColumnDesc(const MCString& col_name);
+  const ColumnDesc *GetColumnDesc(const MCString& col_name) const;
 
   // Check if the lhs_type is convertible to rhs_type.
   bool IsConvertible(const std::shared_ptr<QLType>& lhs_type,
@@ -266,7 +278,50 @@ class SemContext : public ProcessContext {
     current_dml_stmt_ = stmt;
   }
 
-  void Reset();
+  CHECKED_STATUS HasKeyspacePermission(const PermissionType permission,
+                                       const NamespaceName& keyspace_name);
+
+  // Check whether the current role has the specified permission on the keyspace. Returns an
+  // UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasKeyspacePermission(const YBLocation& loc,
+                                            const PermissionType permission,
+                                            const NamespaceName& keyspace_name);
+
+  // Check whether the current role has the specified permission on the keyspace or table. Returns
+  // an UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
+                                         const PermissionType permission,
+                                         const NamespaceName& keyspace_name,
+                                         const TableName& table_name);
+
+  // Convenience method.
+  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
+                                         const PermissionType permission,
+                                         client::YBTableName table_name);
+
+  // Check whether the current role has the specified permission on the role. Returns an
+  // UNAUTHORIZED error message if not found.
+  CHECKED_STATUS CheckHasRolePermission(const YBLocation& loc,
+                                        const PermissionType permission,
+                                        const RoleName& role_name);
+
+  // Check whether the current role has the specified permission on 'ALL KEYSPACES'.
+  CHECKED_STATUS CheckHasAllKeyspacesPermission(const YBLocation& loc,
+                                                const PermissionType permission);
+
+  // Check whether the current role has the specified permission on 'ALL ROLES'.
+  CHECKED_STATUS CheckHasAllRolesPermission(const YBLocation& loc,
+                                            const PermissionType permission);
+
+  bool IsUncoveredIndexSelect() const {
+    if (current_dml_stmt_ == nullptr ||
+        current_dml_stmt_->opcode() != TreeNodeOpcode::kPTSelectStmt) {
+      return false;
+    }
+    // Applicable to SELECT statement only.
+    const auto* select_stmt = static_cast<const PTSelectStmt*>(current_dml_stmt_);
+    return !select_stmt->index_id().empty() && !select_stmt->covers_fully();
+  }
 
  private:
   CHECKED_STATUS LoadSchema(const std::shared_ptr<client::YBTable>& table,
@@ -274,7 +329,7 @@ class SemContext : public ProcessContext {
                             MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
 
   // Find symbol.
-  SymbolEntry *SeekSymbol(const MCString& name);
+  const SymbolEntry *SeekSymbol(const MCString& name) const;
 
   // Symbol table.
   MCMap<MCString, SymbolEntry> symtab_;
@@ -298,5 +353,4 @@ class SemContext : public ProcessContext {
 
 }  // namespace ql
 }  // namespace yb
-
 #endif  // YB_YQL_CQL_QL_PTREE_SEM_CONTEXT_H_

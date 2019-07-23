@@ -19,8 +19,10 @@
 #include <mutex>
 #include <thread>
 
-#include <boost/lockfree/queue.hpp>
 #include <boost/scope_exit.hpp>
+
+#include <cds/container/basket_queue.h>
+#include <cds/gc/dhp.h>
 
 #include "yb/util/thread.h"
 
@@ -31,8 +33,8 @@ namespace {
 
 class Worker;
 
-typedef boost::lockfree::queue<ThreadPoolTask*> TaskQueue;
-typedef boost::lockfree::queue<Worker*> WaitingWorkers;
+typedef cds::container::BasketQueue<cds::gc::DHP, ThreadPoolTask*> TaskQueue;
+typedef cds::container::BasketQueue<cds::gc::DHP, Worker*> WaitingWorkers;
 
 struct ThreadPoolShare {
   ThreadPoolOptions options;
@@ -40,14 +42,13 @@ struct ThreadPoolShare {
   WaitingWorkers waiting_workers;
 
   explicit ThreadPoolShare(ThreadPoolOptions o)
-      : options(std::move(o)),
-        task_queue(options.queue_limit),
-        waiting_workers(options.max_workers) {
-  }
+      : options(std::move(o)) {}
 };
 
 namespace {
+
 const std::string kRpcThreadCategory = "rpc_thread_pool";
+
 } // namespace
 
 class Worker {
@@ -92,6 +93,7 @@ class Worker {
   // Meaning that we does not have work (task queue empty) or
   // does not have free hands (worker queue empty)
   void Execute() {
+    Thread::current_thread()->SetUserData(share_);
     while (!stop_requested_) {
       ThreadPoolTask* task = nullptr;
       if (PopTask(&task)) {
@@ -137,8 +139,8 @@ class Worker {
 
   void AddToWaitingWorkers() {
     if (!added_to_waiting_workers_) {
-      auto pushed = share_->waiting_workers.bounded_push(this);
-      CHECK(pushed);
+      auto pushed = share_->waiting_workers.push(this);
+      DCHECK(pushed); // BasketQueue always succeed.
       added_to_waiting_workers_ = true;
     }
   }
@@ -178,12 +180,9 @@ class ThreadPool::Impl {
       task->Done(shutdown_status_);
       return false;
     }
-    bool added = share_.task_queue.bounded_push(task);
+    bool added = share_.task_queue.push(task);
+    DCHECK(added); // BasketQueue always succeed.
     --adding_;
-    if (!added) {
-      task->Done(queue_full_status_);
-      return false;
-    }
     Worker* worker = nullptr;
     while (share_.waiting_workers.pop(worker)) {
       if (worker->Notify()) {
@@ -236,6 +235,10 @@ class ThreadPool::Impl {
     }
   }
 
+  bool Owns(Thread* thread) {
+    return thread && thread->user_data() == &share_;
+  }
+
  private:
   ThreadPoolShare share_;
   std::vector<std::unique_ptr<Worker>> workers_;
@@ -281,6 +284,14 @@ void ThreadPool::Shutdown() {
 
 const ThreadPoolOptions& ThreadPool::options() const {
   return impl_->options();
+}
+
+bool ThreadPool::Owns(Thread* thread) {
+  return impl_->Owns(thread);
+}
+
+bool ThreadPool::OwnsThisThread() {
+  return Owns(Thread::current_thread());
 }
 
 } // namespace rpc

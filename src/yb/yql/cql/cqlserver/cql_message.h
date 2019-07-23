@@ -116,9 +116,9 @@ class CQLMessage {
 
   // Message body compression schemes.
   enum class CompressionScheme {
-    NONE = 0,
-    LZ4,
-    SNAPPY
+    kNone = 0,
+    kLz4,
+    kSnappy
   };
   static constexpr char kLZ4Compression[] = "lz4";
   static constexpr char kSnappyCompression[] = "snappy";
@@ -903,7 +903,7 @@ class AuthSuccessResponse : public CQLResponse {
 class CQLServerEvent : public rpc::ServerEvent {
  public:
   explicit CQLServerEvent(std::unique_ptr<EventResponse> event_response);
-  void Serialize(std::deque<RefCntBuffer>* output) const override;
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) const override;
   std::string ToString() const override;
  private:
 
@@ -918,7 +918,7 @@ class CQLServerEventList : public rpc::ServerEventList {
  public:
   CQLServerEventList();
   void AddEvent(std::unique_ptr<CQLServerEvent> event);
-  void Serialize(std::deque<RefCntBuffer>* output) const override;
+  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) override;
   std::string ToString() const override;
  private:
   void Transferred(const Status& status, rpc::Connection*) override;

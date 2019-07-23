@@ -70,7 +70,7 @@ using client::YBTableName;
 class RegistrationTest : public YBMiniClusterTestBase<MiniCluster> {
  public:
   RegistrationTest()
-    : schema_({ ColumnSchema("c1", UINT32) }, 1) {
+      : schema_({ ColumnSchema("c1", UINT32, /* is_nullable */ false, /* is_hash_key */ true)}, 1) {
   }
 
   void SetUp() override {
@@ -162,8 +162,7 @@ TEST_F(RegistrationTest, TestTSRegisters) {
   ASSERT_EQ(1, descs.size());
 
   // Verify that the registration is sane.
-  master::TSRegistrationPB reg;
-  descs[0]->GetRegistration(&reg);
+  master::TSRegistrationPB reg = descs[0]->GetRegistration();
   {
     SCOPED_TRACE(reg.ShortDebugString());
     ASSERT_EQ(reg.ShortDebugString().find("0.0.0.0"), string::npos)

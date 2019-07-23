@@ -26,6 +26,7 @@ import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
 import org.yb.util.RandomNumberUtil;
+import org.yb.util.SanitizerUtil;
 
 @RunWith(value=YBTestRunner.class)
 public class TestKeyspace extends BaseCQLTest {
@@ -107,9 +108,9 @@ public class TestKeyspace extends BaseCQLTest {
       useKeyspace(keyspaceName);
 
       for (int i = 0; i < 4; ++i) {
-        final int numRows = TestUtils.isTSAN() ? 1000 : 7500;
+        final int numRows = SanitizerUtil.isTSAN() ? 1000 : 7500;
         LOG.info("Create a big table '" + tableName + "' with " + numRows +
-            " rows (isTSAN=" + TestUtils.isTSAN() + ", build type=" + TestUtils.getBuildType() +
+            " rows (isTSAN=" + SanitizerUtil.isTSAN() + ", build type=" + TestUtils.getBuildType() +
             "). Iteration: " + i);
 
         try {
@@ -466,5 +467,37 @@ public class TestKeyspace extends BaseCQLTest {
     dropKeyspace(keyspaceName1);
 
     LOG.info("--- TEST CQL: QUOTED NAMES - End");
+  }
+
+  @Test
+  public void testUnreservedKeywordName() throws Exception {
+    // REFERENCE used to be KEYWORD, so we have it here, but this test is for keyword STATIC.
+    String unreserved_keywords[] = { "static", "references" };
+
+    // Use the keywords as names.
+    for (String kw : unreserved_keywords) {
+      createKeyspace(kw);
+      useKeyspace(kw);
+
+      // Table static.static(h, r, static STATIC, PRIMARY KEY(h, r)).
+      session.execute(String.format("CREATE TABLE %s" +
+                                    "  (h int, r float, %s text STATIC, PRIMARY KEY(h, r));",
+                                    kw, kw));
+      session.execute(String.format("DROP TABLE %s", kw));
+
+      // Table static.static(static, r, s STATIC, PRIMARY KEY(static, r)).
+      session.execute(String.format("CREATE TABLE %s" +
+                                    "  (%s int, r float, s text STATIC, PRIMARY KEY(%s, r));",
+                                    kw, kw, kw));
+      session.execute(String.format("DROP TABLE %s", kw));
+
+      // Table static.static(h, static, s STATIC, PRIMARY KEY(h, static)).
+      session.execute(String.format("CREATE TABLE %s" +
+                                    "  (h int, %s float, s text STATIC, PRIMARY KEY(h, %s));",
+                                    kw, kw, kw));
+      session.execute(String.format("DROP TABLE %s", kw));
+
+      dropKeyspace(kw);
+    }
   }
 }

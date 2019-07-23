@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -15,6 +15,8 @@
 #define ELOG_H
 
 #include <setjmp.h>
+
+#include "yb/util/ybc_util.h"
 
 /* Error level codes */
 #define DEBUG5		10			/* Debugging messages, in categories of

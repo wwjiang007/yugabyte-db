@@ -37,20 +37,23 @@ set(CLIENT_SRCS
   client.cc
   client_builder-internal.cc
   client-internal.cc
+  client_utils.cc
+  error.cc
   error_collector.cc
-  error-internal.cc
   in_flight_op.cc
   meta_cache.cc
-  session-internal.cc
+  meta_data_cache.cc
+  permissions.cc
+  session.cc
   schema.cc
-  table-internal.cc
-  table_alterer-internal.cc
-  table_creator-internal.cc
+  table.cc
+  table_alterer.cc
+  table_creator.cc
   table_handle.cc
-  tablet_server-internal.cc
   tablet_rpc.cc
   transaction.cc
   transaction_manager.cc
+  transaction_pool.cc
   transaction_rpc.cc
   value.cc
   yb_op.cc
@@ -68,7 +71,8 @@ set(CLIENT_LIBS
   tserver_util
   yb_util
   gutil
-  yrpc)
+  yrpc
+  yb_docdb_encoding)
 
 # We customize the output name/directory of the exported library so that we can
 # call it "yb_client" without it colliding with the regular library.
@@ -98,7 +102,7 @@ target_link_libraries(yb_client_test_util
                       gmock
                       yb_client)
 
-add_library(ql-dml-test-base ql-dml-test-base.cc)
+add_library(ql-dml-test-base ql-dml-test-base.cc txn-test-base.cc)
 target_link_libraries(ql-dml-test-base integration-tests)
 
 # Tests
@@ -111,3 +115,7 @@ ADD_YB_TEST(ql-dml-ttl-test)
 ADD_YB_TEST(ql-list-test)
 ADD_YB_TEST(ql-tablet-test)
 ADD_YB_TEST(ql-transaction-test)
+ADD_YB_TEST(ql-stress-test)
+ADD_YB_TEST(snapshot-txn-test)
+ADD_YB_TEST(serializable-txn-test)
+ADD_YB_TEST(tablet_rpc-test)

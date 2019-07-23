@@ -77,6 +77,15 @@ using strings::SubstituteAndAppend;
 
 namespace rpc {
 
+RpcRetrier::RpcRetrier(CoarseTimePoint deadline, Messenger* messenger, ProxyCache *proxy_cache)
+    : start_(CoarseMonoClock::now()),
+      deadline_(deadline),
+      messenger_(messenger),
+      proxy_cache_(*proxy_cache) {
+  DCHECK(deadline != CoarseTimePoint());
+}
+
+
 bool RpcRetrier::HandleResponse(
     RpcCommand* rpc, Status* out_status, RetryWhenBusy retry_when_busy) {
   ignore_result(DCHECK_NOTNULL(rpc));
@@ -121,7 +130,7 @@ Status RpcRetrier::DelayedRetry(
   attempt_num_++;
 
   RpcRetrierState expected_state = RpcRetrierState::kIdle;
-  while (!state_.compare_exchange_strong(expected_state, RpcRetrierState::kWaiting)) {
+  while (!state_.compare_exchange_strong(expected_state, RpcRetrierState::kScheduling)) {
     if (expected_state == RpcRetrierState::kFinished) {
       auto result = STATUS_FORMAT(IllegalState, "Retry of finished command: $0", rpc);
       LOG(WARNING) << result;
@@ -137,7 +146,20 @@ Status RpcRetrier::DelayedRetry(
   auto retain_rpc = rpc->shared_from_this();
   task_id_ = messenger_->ScheduleOnReactor(
       std::bind(&RpcRetrier::DoRetry, this, rpc, _1), MonoDelta::FromMilliseconds(num_ms),
-      messenger_);
+      SOURCE_LOCATION(), messenger_);
+
+  // Scheduling state can be changed only in this method, so we expected both
+  // exchanges below to succeed.
+  expected_state = RpcRetrierState::kScheduling;
+  if (task_id_.load(std::memory_order_acquire) == kInvalidTaskId) {
+    auto result = STATUS_FORMAT(Aborted, "Failed to schedule: $0", rpc);
+    LOG(WARNING) << result;
+    CHECK(state_.compare_exchange_strong(
+        expected_state, RpcRetrierState::kFinished, std::memory_order_acq_rel));
+    return result;
+  }
+  CHECK(state_.compare_exchange_strong(
+      expected_state, RpcRetrierState::kWaiting, std::memory_order_acq_rel));
   return Status::OK();
 }
 
@@ -146,10 +168,18 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
 
   RpcRetrierState expected_state = RpcRetrierState::kWaiting;
   bool run = state_.compare_exchange_strong(expected_state, RpcRetrierState::kRunning);
-  if (!run && expected_state == RpcRetrierState::kIdle) {
+  // There is very rare case when we get here before switching from scheduling to waiting state.
+  // It happens only during shutdown, when it invoked soon after we scheduled retry.
+  // So we are doing busy wait here, to avoid overhead in general case.
+  while (!run && expected_state == RpcRetrierState::kScheduling) {
+    expected_state = RpcRetrierState::kWaiting;
     run = state_.compare_exchange_strong(expected_state, RpcRetrierState::kRunning);
+    if (run) {
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
   }
-  task_id_ = -1;
+  task_id_ = kInvalidTaskId;
   if (!run) {
     rpc->Finished(STATUS_FORMAT(
         Aborted, "$0 aborted: $1", rpc->ToString(), yb::rpc::ToString(expected_state)));
@@ -158,12 +188,11 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
   Status new_status = status;
   if (new_status.ok()) {
     // Has this RPC timed out?
-    if (deadline_.Initialized()) {
-      MonoTime now = MonoTime::Now();
-      if (deadline_.ComesBefore(now)) {
-        string err_str = Substitute(
-          "$0 passed its deadline $1 (now: $2)", rpc->ToString(),
-          deadline_.ToString(), now.ToString());
+    if (deadline_ != CoarseTimePoint::max()) {
+      auto now = CoarseMonoClock::Now();
+      if (deadline_ < now) {
+        string err_str = Format(
+          "$0 passed its deadline $1 (passed: $2)", *rpc, deadline_, now - start_);
         if (!last_error_.ok()) {
           SubstituteAndAppend(&err_str, ": $0", last_error_.ToString());
         }
@@ -187,7 +216,14 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
 }
 
 RpcRetrier::~RpcRetrier() {
-  DCHECK_EQ(-1, task_id_);
+  auto task_id = task_id_.load(std::memory_order_acquire);
+  auto state = state_.load(std::memory_order_acquire);
+
+  LOG_IF(
+      DFATAL,
+      (kInvalidTaskId != task_id) ||
+          (RpcRetrierState::kFinished != state && RpcRetrierState::kIdle != state))
+      << "Destroying RpcRetrier in invalid state: " << ToString();
 }
 
 void RpcRetrier::Abort() {
@@ -203,7 +239,7 @@ void RpcRetrier::Abort() {
   }
   for (;;) {
     auto task_id = task_id_.load(std::memory_order_acquire);
-    if (task_id == -1) {
+    if (task_id == kInvalidTaskId) {
       break;
     }
     messenger_->AbortOnReactor(task_id);
@@ -222,8 +258,17 @@ RpcController* RpcRetrier::PrepareController(MonoDelta single_call_timeout) {
   if (!single_call_timeout) {
     single_call_timeout = MonoDelta::FromMilliseconds(FLAGS_retryable_rpc_single_call_timeout_ms);
   }
-  controller_.set_deadline(std::min(deadline_, MonoTime::Now() + single_call_timeout));
+  controller_.set_timeout(std::min<MonoDelta>(
+      deadline_ - CoarseMonoClock::now(), single_call_timeout));
   return &controller_;
+}
+
+void Rpc::ScheduleRetry(const Status& status) {
+  auto retry_status = mutable_retrier()->DelayedRetry(this, status);
+  if (!retry_status.ok()) {
+    LOG(WARNING) << "Failed to schedule retry: " << retry_status;
+    Finished(retry_status);
+  }
 }
 
 Rpcs::Rpcs(std::mutex* mutex) {
@@ -235,26 +280,31 @@ Rpcs::Rpcs(std::mutex* mutex) {
   }
 }
 
-void Rpcs::Shutdown() {
+CoarseTimePoint Rpcs::DoRequestAbortAll(RequestShutdown shutdown) {
   std::vector<Calls::value_type> calls;
   {
     std::lock_guard<std::mutex> lock(*mutex_);
     if (!shutdown_) {
-      shutdown_ = true;
+      shutdown_ = shutdown;
       calls.reserve(calls_.size());
       calls.assign(calls_.begin(), calls_.end());
     }
   }
-  auto deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(FLAGS_rpcs_shutdown_timeout_ms);
+  auto deadline = CoarseMonoClock::now() + FLAGS_rpcs_shutdown_timeout_ms * 1ms;
   // It takes some time to complete rpc command after its deadline has passed.
   // So we add extra time for it.
   auto single_call_extra_delay = std::chrono::milliseconds(FLAGS_rpcs_shutdown_extra_delay_ms);
   for (auto& call : calls) {
     CHECK(call);
     call->Abort();
-    deadline = std::max(deadline, call->deadline().ToSteadyTimePoint() + single_call_extra_delay);
+    deadline = std::max(deadline, call->deadline() + single_call_extra_delay);
   }
+
+  return deadline;
+}
+
+void Rpcs::Shutdown() {
+  auto deadline = DoRequestAbortAll(RequestShutdown::kTrue);
   {
     std::unique_lock<std::mutex> lock(*mutex_);
     while (!calls_.empty()) {
@@ -312,6 +362,10 @@ Rpcs::Handle Rpcs::Prepare() {
   }
   calls_.emplace_back();
   return --calls_.end();
+}
+
+void Rpcs::RequestAbortAll() {
+  DoRequestAbortAll(RequestShutdown::kFalse);
 }
 
 void Rpcs::Abort(std::initializer_list<Handle*> list) {

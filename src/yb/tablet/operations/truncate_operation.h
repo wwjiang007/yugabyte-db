@@ -43,9 +43,7 @@ class TruncateOperationState : public OperationState {
 
   const tserver::TruncateRequestPB* request() const override { return request_; }
 
-  void UpdateRequestFromConsensusRound() override {
-    request_ = consensus_round()->replicate_msg()->mutable_truncate_request();
-  }
+  void UpdateRequestFromConsensusRound() override;
 
   virtual std::string ToString() const override;
 
@@ -59,8 +57,7 @@ class TruncateOperationState : public OperationState {
 // Executes the truncate transaction.
 class TruncateOperation : public Operation {
  public:
-  TruncateOperation(std::unique_ptr<TruncateOperationState> operation_state,
-                    consensus::DriverType type);
+  explicit TruncateOperation(std::unique_ptr<TruncateOperationState> operation_state);
 
   TruncateOperationState* state() override {
     return down_cast<TruncateOperationState*>(Operation::state());
@@ -75,7 +72,7 @@ class TruncateOperation : public Operation {
   CHECKED_STATUS Prepare() override { return Status::OK(); }
 
   // Executes an Apply for the truncate transaction.
-  CHECKED_STATUS Apply() override;
+  CHECKED_STATUS Apply(int64_t leader_term) override;
 
   std::string ToString() const override;
 

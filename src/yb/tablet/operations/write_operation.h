@@ -43,8 +43,9 @@
 #include "yb/common/schema.h"
 
 #include "yb/docdb/doc_operation.h"
-#include "yb/docdb/shared_lock_manager_fwd.h"
+#include "yb/docdb/intent.h"
 #include "yb/docdb/lock_batch.h"
+#include "yb/docdb/shared_lock_manager_fwd.h"
 
 #include "yb/gutil/macros.h"
 
@@ -91,7 +92,8 @@ class WriteOperationState : public OperationState {
  public:
   WriteOperationState(Tablet* tablet = nullptr,
                       const tserver::WriteRequestPB *request = nullptr,
-                      tserver::WriteResponsePB *response = nullptr);
+                      tserver::WriteResponsePB *response = nullptr,
+                      docdb::OperationKind kind = docdb::OperationKind::kWrite);
   virtual ~WriteOperationState();
 
   // Returns the original client request for this transaction, if there was
@@ -104,9 +106,7 @@ class WriteOperationState : public OperationState {
     return request_;
   }
 
-  void UpdateRequestFromConsensusRound() override {
-    request_ = consensus_round()->replicate_msg()->mutable_write_request();
-  }
+  void UpdateRequestFromConsensusRound() override;
 
   // Returns the prepared response to the client that will be sent when this
   // transaction is completed, if this transaction was started by a client.
@@ -145,14 +145,18 @@ class WriteOperationState : public OperationState {
   }
 
   // Releases all the DocDB locks acquired by this transaction.
-  void ReleaseDocDbLocks(Tablet* tablet);
+  void ReleaseDocDbLocks();
 
   // Resets this OperationState, releasing all locks, destroying all prepared
   // writes, clearing the transaction result _and_ committing the current Mvcc
   // transaction.
   void Reset();
 
-  virtual std::string ToString() const override;
+  std::string ToString() const override;
+
+  docdb::OperationKind kind() const {
+    return kind_;
+  }
 
  private:
   // Reset the response, and row_ops_ (which refers to data
@@ -179,13 +183,16 @@ class WriteOperationState : public OperationState {
   // or if an error happens.
   LockBatch docdb_locks_;
 
+  docdb::OperationKind kind_;
+
   DISALLOW_COPY_AND_ASSIGN(WriteOperationState);
 };
 
 class WriteOperationContext {
  public:
   // When operation completes, its callback is executed.
-  virtual void StartExecution(std::unique_ptr<Operation> operation) = 0;
+  virtual void Submit(std::unique_ptr<Operation> operation, int64_t term) = 0;
+  virtual void Aborted(Operation* operation) = 0;
   virtual HybridTime ReportReadRestart() = 0;
 
   virtual ~WriteOperationContext() {}
@@ -194,8 +201,10 @@ class WriteOperationContext {
 // Executes a write transaction.
 class WriteOperation : public Operation {
  public:
-  WriteOperation(std::unique_ptr<WriteOperationState> operation_state, consensus::DriverType type,
-                 MonoTime deadline, WriteOperationContext* context);
+  WriteOperation(std::unique_ptr<WriteOperationState> operation_state, int64_t term,
+                 CoarseTimePoint deadline, WriteOperationContext* context);
+
+  ~WriteOperation();
 
   WriteOperationState* state() override {
     return down_cast<WriteOperationState*>(Operation::state());
@@ -231,10 +240,7 @@ class WriteOperation : public Operation {
   // are placed in the queue (but not necessarily in the same order of the
   // original requests) which is already a requirement of the consensus
   // algorithm.
-  CHECKED_STATUS Apply() override;
-
-  // Releases the row locks (Early Lock Release).
-  void PreCommit() override;
+  CHECKED_STATUS Apply(int64_t leader_term) override;
 
   // If result == COMMITTED, commits the mvcc transaction and updates
   // the metrics, if result == ABORTED aborts the mvcc transaction.
@@ -262,7 +268,7 @@ class WriteOperation : public Operation {
     restart_read_ht_ = value;
   }
 
-  const MonoTime deadline() const {
+  CoarseTimePoint deadline() const {
     return deadline_;
   }
 
@@ -282,7 +288,8 @@ class WriteOperation : public Operation {
   void DoStartSynchronization(const Status& status);
 
   WriteOperationContext& context_;
-  const MonoTime deadline_;
+  const int64_t term_;
+  const CoarseTimePoint deadline_;
 
   // this transaction's start time
   MonoTime start_time_;
@@ -290,6 +297,9 @@ class WriteOperation : public Operation {
   HybridTime restart_read_ht_;
 
   docdb::DocOperations doc_ops_;
+
+  // True if operation was submitted, i.e. context_.Submit(this) was invoked.
+  bool submitted_;
 
   Tablet* tablet() { return state()->tablet(); }
 

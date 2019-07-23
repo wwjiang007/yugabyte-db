@@ -18,6 +18,7 @@
 #ifndef YB_YQL_CQL_QL_PTREE_PT_GRANT_REVOKE_H_
 #define YB_YQL_CQL_QL_PTREE_PT_GRANT_REVOKE_H_
 
+#include "yb/common/roles_permissions.h"
 #include "yb/common/schema.h"
 #include "yb/common/common.pb.h"
 #include "yb/master/master.pb.h"
@@ -33,7 +34,7 @@ namespace yb {
 namespace ql {
 
 //--------------------------------------------------------------------------------------------------
-// GRANT Role Statement
+// GRANT Role Statement.
 
 class PTGrantRevokeRole : public TreeNode {
  public:
@@ -62,9 +63,8 @@ class PTGrantRevokeRole : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override {
-    return Status::OK();
-  }
+  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override;
+
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   // Name of role that is being granted.
@@ -89,7 +89,7 @@ class PTGrantRevokeRole : public TreeNode {
 };
 
 //--------------------------------------------------------------------------------------------------
-// GRANT Permission Statement
+// GRANT Permission Statement.
 
 class PTGrantRevokePermission : public TreeNode {
  public:
@@ -101,11 +101,11 @@ class PTGrantRevokePermission : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTGrantRevokePermission(MemoryContext* memctx, YBLocation::SharedPtr loc,
-                    GrantRevokeStatementType statement_type,
-                    const MCSharedPtr<MCString>& permission_name,
-                    const ResourceType& resource_type,
-                    const PTQualifiedName::SharedPtr& resource_name,
-                    const PTQualifiedName::SharedPtr& role_name);
+                          GrantRevokeStatementType statement_type,
+                          const MCSharedPtr<MCString>& permission_name,
+                          const ResourceType& resource_type,
+                          const PTQualifiedName::SharedPtr& resource_name,
+                          const PTQualifiedName::SharedPtr& role_name);
   virtual ~PTGrantRevokePermission();
 
   static const std::map<std::string, PermissionType> kPermissionMap;
@@ -140,7 +140,7 @@ class PTGrantRevokePermission : public TreeNode {
     return resource_type_;
   }
 
-  // Name of resource, i.e role/table/keyspace.
+  // Name of resource, e.g. role_eng, table_salaries, keyspace_qa.
   const char* resource_name() const {
     if (resource_type_ == ResourceType::ALL_ROLES ||
         resource_type_ == ResourceType::ALL_KEYSPACES) {
@@ -172,9 +172,9 @@ class PTGrantRevokePermission : public TreeNode {
     }
 
     if (resource_type_ == ResourceType::ALL_ROLES || resource_type_ == ResourceType::ROLE) {
-      prefix = "roles";
+      prefix = kRolesRoleResource;
     } else {
-      prefix = "data";
+      prefix = kRolesDataResource;
     }
     std::string full_name = prefix + suffix;
     return full_name;
@@ -184,6 +184,7 @@ class PTGrantRevokePermission : public TreeNode {
   const GrantRevokeStatementType statement_type_;
   PermissionType permission_;
   const MCSharedPtr<MCString> permission_name_;
+  // complete_resource_name_ is nullptr for ALL KEYSPACES and ALL ROLES.
   const PTQualifiedName::SharedPtr complete_resource_name_;
   const PTQualifiedName::SharedPtr role_name_;
   const ResourceType resource_type_;

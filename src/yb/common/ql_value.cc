@@ -32,9 +32,6 @@
 
 using yb::operator"" _MB;
 
-DEFINE_bool(neil_crash_it, false, "Crashing flag");
-DEFINE_bool(neil_test_pgsql, false, "PGSQL test flag");
-
 // Maximumum value size is 64MB
 DEFINE_int32(yql_max_value_size, 64_MB,
              "Maximum size of a value in the Yugabyte Query Layer");
@@ -44,8 +41,6 @@ DEFINE_int32(yql_max_value_size, 64_MB,
   case NULL_VALUE_TYPE: FALLTHROUGH_INTENDED; \
   case TUPLE: FALLTHROUGH_INTENDED;     \
   case TYPEARGS: FALLTHROUGH_INTENDED;  \
-  case DATE: FALLTHROUGH_INTENDED;      \
-  case TIME: FALLTHROUGH_INTENDED;      \
   case UNKNOWN_DATA
 
 #define QL_INVALID_TYPES_IN_SWITCH     \
@@ -84,6 +79,8 @@ DataType QLValue::FromInternalDataType(const InternalType& internal_type) {
       return DataType::INT32;
     case QLValue::InternalType::kInt64Value:
       return DataType::INT64;
+    case QLValue::InternalType::kUint32Value:
+      return DataType::UINT32;
     case QLValue::InternalType::kFloatValue:
       return DataType::FLOAT;
     case QLValue::InternalType::kDoubleValue:
@@ -94,6 +91,10 @@ DataType QLValue::FromInternalDataType(const InternalType& internal_type) {
       return DataType::STRING;
     case QLValue::InternalType::kTimestampValue:
       return DataType::TIMESTAMP;
+    case QLValue::InternalType::kDateValue:
+      return DataType::DATE;
+    case QLValue::InternalType::kTimeValue:
+      return DataType::TIME;
     case QLValue::InternalType::kInetaddressValue:
       return DataType::INET;
     case QLValue::InternalType::kJsonbValue:
@@ -129,6 +130,7 @@ const string QLValue::ToCQLString(const InternalType& internal_type) {
     case InternalType::kInt16Value: return "smallint";
     case InternalType::kInt32Value: return "int";
     case InternalType::kInt64Value: return "bigint";
+    case InternalType::kUint32Value: return "unknown"; // No such type in YCQL
     case InternalType::kStringValue: return "text";
     case InternalType::kBoolValue: return "boolean";
     case InternalType::kFloatValue: return "float";
@@ -144,6 +146,8 @@ const string QLValue::ToCQLString(const InternalType& internal_type) {
     case InternalType::kSetValue: return "set";
     case InternalType::kUuidValue: return "uuid";
     case InternalType::kTimeuuidValue: return "timeuuid";
+    case InternalType::kDateValue: return "date";
+    case InternalType::kTimeValue: return "time";
     case InternalType::kFrozenValue: return "frozen";
   }
   LOG (FATAL) << "Invalid datatype: " << internal_type;
@@ -159,6 +163,7 @@ int QLValue::CompareTo(const QLValue& other) const {
     case InternalType::kInt16Value:  return GenericCompare(int16_value(), other.int16_value());
     case InternalType::kInt32Value:  return GenericCompare(int32_value(), other.int32_value());
     case InternalType::kInt64Value:  return GenericCompare(int64_value(), other.int64_value());
+    case InternalType::kUint32Value:  return GenericCompare(uint32_value(), other.uint32_value());
     case InternalType::kFloatValue:  {
       bool is_nan_0 = util::IsNanFloat(float_value());
       bool is_nan_1 = util::IsNanFloat(other.float_value());
@@ -191,6 +196,8 @@ int QLValue::CompareTo(const QLValue& other) const {
       return GenericCompare(uuid_value(), other.uuid_value());
     case InternalType::kTimeuuidValue:
       return GenericCompare(timeuuid_value(), other.timeuuid_value());
+    case InternalType::kDateValue: return GenericCompare(date_value(), other.date_value());
+    case InternalType::kTimeValue: return GenericCompare(time_value(), other.time_value());
     case QLValuePB::kFrozenValue: {
       return Compare(frozen_value(), other.frozen_value());
     }
@@ -216,6 +223,10 @@ int QLValue::CompareTo(const QLValue& other) const {
 // The internal methods such as AppendIntToKey should be renamed accordingly.
 void AppendToKey(const QLValuePB &value_pb, string *bytes) {
   switch (value_pb.value_case()) {
+    case QLValue::InternalType::kBoolValue: {
+      YBPartition::AppendIntToKey<bool, uint8>(value_pb.bool_value() ? 1 : 0, bytes);
+      break;
+    }
     case QLValue::InternalType::kInt8Value: {
       YBPartition::AppendIntToKey<int8, uint8>(value_pb.int8_value(), bytes);
       break;
@@ -232,8 +243,20 @@ void AppendToKey(const QLValuePB &value_pb, string *bytes) {
       YBPartition::AppendIntToKey<int64, uint64>(value_pb.int64_value(), bytes);
       break;
     }
+    case QLValue::InternalType::kUint32Value: {
+      YBPartition::AppendIntToKey<uint32, uint32>(value_pb.uint32_value(), bytes);
+      break;
+    }
     case QLValue::InternalType::kTimestampValue: {
       YBPartition::AppendIntToKey<int64, uint64>(value_pb.timestamp_value(), bytes);
+      break;
+    }
+    case QLValue::InternalType::kDateValue: {
+      YBPartition::AppendIntToKey<uint32, uint32>(value_pb.date_value(), bytes);
+      break;
+    }
+    case QLValue::InternalType::kTimeValue: {
+      YBPartition::AppendIntToKey<int64, uint64>(value_pb.time_value(), bytes);
       break;
     }
     case QLValue::InternalType::kStringValue: {
@@ -289,7 +312,6 @@ void AppendToKey(const QLValuePB &value_pb, string *bytes) {
     }
     case QLValue::InternalType::VALUE_NOT_SET:
       break;
-    case QLValue::InternalType::kBoolValue: FALLTHROUGH_INTENDED;
     case QLValue::InternalType::kMapValue: FALLTHROUGH_INTENDED;
     case QLValue::InternalType::kSetValue: FALLTHROUGH_INTENDED;
     case QLValue::InternalType::kListValue: FALLTHROUGH_INTENDED;
@@ -338,12 +360,7 @@ void QLValue::Serialize(
       return;
     }
     case VARINT: {
-      bool is_out_of_range = false;
-      CQLEncodeBytes(varint_value().EncodeToTwosComplement(&is_out_of_range), buffer);
-      // This should never happen
-      if(is_out_of_range) {
-        LOG(ERROR) << "Varint encoding returned out of range for " << varint_value().ToString();
-      }
+      CQLEncodeBytes(varint_value().EncodeToTwosComplement(), buffer);
       return;
     }
     case STRING:
@@ -358,8 +375,16 @@ void QLValue::Serialize(
     case TIMESTAMP: {
       int64_t val = DateTime::AdjustPrecision(timestamp_value_pb(),
                                               DateTime::kInternalPrecision,
-                                              DateTime::CqlDateTimeInputFormat.input_precision());
+                                              DateTime::CqlInputFormat.input_precision);
       CQLEncodeNum(NetworkByteOrder::Store64, val, buffer);
+      return;
+    }
+    case DATE: {
+      CQLEncodeNum(NetworkByteOrder::Store32, date_value(), buffer);
+      return;
+    }
+    case TIME: {
+      CQLEncodeNum(NetworkByteOrder::Store64, time_value(), buffer);
       return;
     }
     case INET: {
@@ -572,8 +597,21 @@ Status QLValue::Deserialize(
       int64_t value = 0;
       RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load64, data, &value));
       value = DateTime::AdjustPrecision(value,
-          DateTime::CqlDateTimeInputFormat.input_precision(), DateTime::kInternalPrecision);
+                                        DateTime::CqlInputFormat.input_precision,
+                                        DateTime::kInternalPrecision);
       set_timestamp_value(value);
+      return Status::OK();
+    }
+    case DATE: {
+      uint32_t value = 0;
+      RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load32, data, &value));
+      set_date_value(value);
+      return Status::OK();
+    }
+    case TIME: {
+      int64_t value = 0;
+      RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load64, data, &value));
+      set_time_value(value);
       return Status::OK();
     }
     case INET: {
@@ -747,6 +785,7 @@ string QLValue::ToString() const {
     case InternalType::kInt16Value: return "int16:" + to_string(int16_value());
     case InternalType::kInt32Value: return "int32:" + to_string(int32_value());
     case InternalType::kInt64Value: return "int64:" + to_string(int64_value());
+    case InternalType::kUint32Value: return "uint32:" + to_string(uint32_value());
     case InternalType::kFloatValue: return "float:" + to_string(float_value());
     case InternalType::kDoubleValue: return "double:" + to_string(double_value());
     case InternalType::kDecimalValue:
@@ -755,6 +794,8 @@ string QLValue::ToString() const {
       return "varint: " + varint_value().ToString();
     case InternalType::kStringValue: return "string:" + FormatBytesAsStr(string_value());
     case InternalType::kTimestampValue: return "timestamp:" + timestamp_value().ToFormattedString();
+    case InternalType::kDateValue: return "date:" + to_string(date_value());
+    case InternalType::kTimeValue: return "time:" + to_string(time_value());
     case InternalType::kInetaddressValue: return "inetaddress:" + inetaddress_value().ToString();
     case InternalType::kJsonbValue: return "jsonb:" + FormatBytesAsStr(jsonb_value());
     case InternalType::kUuidValue: return "uuid:" + uuid_value().ToString();
@@ -845,6 +886,9 @@ bool EitherIsNull(const QLValuePB& lhs, const QLValuePB& rhs) {
 bool BothNotNull(const QLValuePB& lhs, const QLValuePB& rhs) {
   return !IsNull(lhs) && !IsNull(rhs);
 }
+bool BothNull(const QLValuePB& lhs, const QLValuePB& rhs) {
+  return IsNull(lhs) && IsNull(rhs);
+}
 bool Comparable(const QLValuePB& lhs, const QLValuePB& rhs) {
   return lhs.value_case() == rhs.value_case() || EitherIsNull(lhs, rhs);
 }
@@ -857,6 +901,9 @@ bool Comparable(const QLValuePB& lhs, const QLValue& rhs) {
 bool BothNotNull(const QLValuePB& lhs, const QLValue& rhs) {
   return !IsNull(lhs) && !rhs.IsNull();
 }
+bool BothNull(const QLValuePB& lhs, const QLValue& rhs) {
+  return IsNull(lhs) && rhs.IsNull();
+}
 int Compare(const QLValuePB& lhs, const QLValuePB& rhs) {
   CHECK(Comparable(lhs, rhs));
   CHECK(BothNotNull(lhs, rhs));
@@ -865,6 +912,7 @@ int Compare(const QLValuePB& lhs, const QLValuePB& rhs) {
     case QLValuePB::kInt16Value:  return GenericCompare(lhs.int16_value(), rhs.int16_value());
     case QLValuePB::kInt32Value:  return GenericCompare(lhs.int32_value(), rhs.int32_value());
     case QLValuePB::kInt64Value:  return GenericCompare(lhs.int64_value(), rhs.int64_value());
+    case QLValuePB::kUint32Value:  return GenericCompare(lhs.uint32_value(), rhs.uint32_value());
     case QLValuePB::kFloatValue:  {
       bool is_nan_0 = util::IsNanFloat(lhs.float_value());
       bool is_nan_1 = util::IsNanFloat(rhs.float_value());
@@ -888,6 +936,8 @@ int Compare(const QLValuePB& lhs, const QLValuePB& rhs) {
     case QLValuePB::kBoolValue: return Compare(lhs.bool_value(), rhs.bool_value());
     case QLValuePB::kTimestampValue:
       return GenericCompare(lhs.timestamp_value(), rhs.timestamp_value());
+    case QLValuePB::kDateValue: return GenericCompare(lhs.date_value(), rhs.date_value());
+    case QLValuePB::kTimeValue: return GenericCompare(lhs.time_value(), rhs.time_value());
     case QLValuePB::kBinaryValue: return lhs.binary_value().compare(rhs.binary_value());
     case QLValuePB::kInetaddressValue:
       return GenericCompare(lhs.inetaddress_value(), rhs.inetaddress_value());
@@ -925,6 +975,7 @@ int Compare(const QLValuePB& lhs, const QLValue& rhs) {
       return GenericCompare(static_cast<int16_t>(lhs.int16_value()), rhs.int16_value());
     case QLValuePB::kInt32Value:  return GenericCompare(lhs.int32_value(), rhs.int32_value());
     case QLValuePB::kInt64Value:  return GenericCompare(lhs.int64_value(), rhs.int64_value());
+    case QLValuePB::kUint32Value:  return GenericCompare(lhs.uint32_value(), rhs.uint32_value());
     case QLValuePB::kFloatValue:  {
       bool is_nan_0 = util::IsNanFloat(lhs.float_value());
       bool is_nan_1 = util::IsNanFloat(rhs.float_value());
@@ -948,6 +999,8 @@ int Compare(const QLValuePB& lhs, const QLValue& rhs) {
     case QLValuePB::kBoolValue: return Compare(lhs.bool_value(), rhs.bool_value());
     case QLValuePB::kTimestampValue:
       return GenericCompare(lhs.timestamp_value(), rhs.timestamp_value_pb());
+    case QLValuePB::kDateValue: return GenericCompare(lhs.date_value(), rhs.date_value());
+    case QLValuePB::kTimeValue: return GenericCompare(lhs.time_value(), rhs.time_value());
     case QLValuePB::kBinaryValue: return lhs.binary_value().compare(rhs.binary_value());
     case QLValuePB::kInetaddressValue:
       return GenericCompare(QLValue(lhs).inetaddress_value(), rhs.inetaddress_value());
@@ -1006,49 +1059,48 @@ int Compare(const bool lhs, const bool rhs) {
   }
 }
 
+// In YCQL null is not comparable with regular values (w.r.t. ordering).
 bool operator <(const QLValuePB& lhs, const QLValuePB& rhs) {
   return BothNotNull(lhs, rhs) && Compare(lhs, rhs) < 0;
 }
 bool operator >(const QLValuePB& lhs, const QLValuePB& rhs) {
   return BothNotNull(lhs, rhs) && Compare(lhs, rhs) > 0;
 }
+
+// In YCQL equality holds for null values.
 bool operator <=(const QLValuePB& lhs, const QLValuePB& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) <= 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) <= 0) || BothNull(lhs, rhs);
 }
 bool operator >=(const QLValuePB& lhs, const QLValuePB& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) >= 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) >= 0) || BothNull(lhs, rhs);
 }
 bool operator ==(const QLValuePB& lhs, const QLValuePB& rhs) {
-  // Equality holds for null values
-  if (IsNull(lhs) && IsNull(rhs)) {
-    return true;
-  }
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) == 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) == 0) || BothNull(lhs, rhs);
 }
 bool operator !=(const QLValuePB& lhs, const QLValuePB& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) != 0;
+  return !(lhs == rhs);
 }
+
+// In YCQL null is not comparable with regular values (w.r.t. ordering).
 bool operator <(const QLValuePB& lhs, const QLValue& rhs) {
   return BothNotNull(lhs, rhs) && Compare(lhs, rhs) < 0;
 }
 bool operator >(const QLValuePB& lhs, const QLValue& rhs) {
   return BothNotNull(lhs, rhs) && Compare(lhs, rhs) > 0;
 }
+
+// In YCQL equality holds for null values.
 bool operator <=(const QLValuePB& lhs, const QLValue& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) <= 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) <= 0) || BothNull(lhs, rhs);
 }
 bool operator >=(const QLValuePB& lhs, const QLValue& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) >= 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) >= 0) || BothNull(lhs, rhs);
 }
 bool operator ==(const QLValuePB& lhs, const QLValue& rhs) {
-  // Equality holds for null values
-  if (IsNull(lhs) && rhs.IsNull()) {
-    return true;
-  }
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) == 0;
+  return (BothNotNull(lhs, rhs) && Compare(lhs, rhs) == 0) || BothNull(lhs, rhs);
 }
 bool operator !=(const QLValuePB& lhs, const QLValue& rhs) {
-  return BothNotNull(lhs, rhs) && Compare(lhs, rhs) != 0;
+  return !(lhs == rhs);
 }
 
 } // namespace yb

@@ -43,7 +43,6 @@
 
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_reader.h"
-#include "yb/consensus/ref_counted_replicate.h"
 #include "yb/gutil/bind.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
@@ -55,6 +54,9 @@
 #include "yb/util/metrics.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
+#include "yb/util/size_literals.h"
+
+using namespace std::literals;
 
 DEFINE_int32(log_cache_size_limit_mb, 128,
              "The total per-tablet size of consensus entries which may be kept in memory. "
@@ -80,12 +82,17 @@ METRIC_DEFINE_gauge_int64(tablet, log_cache_size, "Log Cache Memory Usage",
                           MetricUnit::kBytes,
                           "Amount of memory in use for caching the local log.");
 
-static const char kParentMemTrackerId[] = "log_cache";
+namespace {
+
+const std::string kParentMemTrackerId = "log_cache"s;
+
+}
 
 typedef vector<const ReplicateMsg*>::const_iterator MsgIter;
 
 LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
                    const scoped_refptr<log::Log>& log,
+                   const MemTrackerPtr& server_tracker,
                    const string& local_uuid,
                    const string& tablet_id)
   : log_(log),
@@ -95,20 +102,20 @@ LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
     min_pinned_op_index_(0),
     metrics_(metric_entity) {
 
-
-  const int64_t max_ops_size_bytes = FLAGS_log_cache_size_limit_mb * 1024 * 1024;
-  const int64_t global_max_ops_size_bytes = FLAGS_global_log_cache_size_limit_mb * 1024 * 1024;
+  const int64_t max_ops_size_bytes = FLAGS_log_cache_size_limit_mb * 1_MB;
+  const int64_t global_max_ops_size_bytes = FLAGS_global_log_cache_size_limit_mb * 1_MB;
 
   // Set up (or reuse) a tracker with the global limit. It is parented directly to the root tracker
   // so that it's always global.
   parent_tracker_ = MemTracker::FindOrCreateTracker(global_max_ops_size_bytes,
-                                                    kParentMemTrackerId);
+                                                    kParentMemTrackerId,
+                                                    server_tracker);
 
   // And create a child tracker with the per-tablet limit.
   tracker_ = MemTracker::CreateTracker(
-      max_ops_size_bytes, Substitute("$0:$1:$2", kParentMemTrackerId,
-                                     local_uuid, tablet_id),
-      parent_tracker_);
+      max_ops_size_bytes, Format("$0-$1", kParentMemTrackerId, tablet_id), parent_tracker_,
+      AddToParent::kTrue, CreateMetrics::kFalse);
+  tracker_->SetMetricEntity(metric_entity, kParentMemTrackerId);
 
   // Put a fake message at index 0, since this simplifies a lot of our code paths elsewhere.
   auto zero_op = std::make_shared<ReplicateMsg>();
@@ -130,24 +137,21 @@ void LogCache::Init(const OpId& preceding_op) {
   min_pinned_op_index_ = next_sequential_op_index_;
 }
 
-Status LogCache::AppendOperations(const ReplicateMsgs& msgs,
-                                  const StatusCallback& callback) {
-  CHECK_GT(msgs.size(), 0);
-
+Result<LogCache::PrepareAppendResult> LogCache::PrepareAppendOperations(const ReplicateMsgs& msgs) {
   // SpaceUsed is relatively expensive, so do calculations outside the lock
-  int64_t mem_required = 0;
-  vector<CacheEntry> entries_to_insert;
+  PrepareAppendResult result;
+  std::vector<CacheEntry> entries_to_insert;
   entries_to_insert.reserve(msgs.size());
   for (const auto& msg : msgs) {
     CacheEntry e = { msg, static_cast<int64_t>(msg->SpaceUsedLong()) };
-    mem_required += e.mem_usage;
+    result.mem_required += e.mem_usage;
     entries_to_insert.emplace_back(std::move(e));
   }
 
   int64_t first_idx_in_batch = msgs.front()->id().index();
-  int64_t last_idx_in_batch = msgs.back()->id().index();
+  result.last_idx_in_batch = msgs.back()->id().index();
 
-  std::unique_lock<simple_spinlock> l(lock_);
+  std::unique_lock<simple_spinlock> lock(lock_);
   // If we're not appending a consecutive op we're likely overwriting and need to replace operations
   // in the cache.
   if (first_idx_in_batch != next_sequential_op_index_) {
@@ -166,15 +170,15 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs,
   }
 
   // Try to consume the memory. If it can't be consumed, we may need to evict.
-  bool borrowed_memory = false;
-  if (!tracker_->TryConsume(mem_required)) {
+  if (!tracker_->TryConsume(result.mem_required)) {
     int spare = tracker_->SpareCapacity();
-    int need_to_free = mem_required - spare;
-    VLOG_WITH_PREFIX_UNLOCKED(1) << "Memory limit would be exceeded trying to append "
-                        << HumanReadableNumBytes::ToString(mem_required)
-                        << " to log cache (available="
-                        << HumanReadableNumBytes::ToString(spare)
-                        << "): attempting to evict some operations...";
+    int need_to_free = result.mem_required - spare;
+    VLOG_WITH_PREFIX_UNLOCKED(1)
+        << "Memory limit would be exceeded trying to append "
+        << HumanReadableNumBytes::ToString(result.mem_required)
+        << " to log cache (available="
+        << HumanReadableNumBytes::ToString(spare)
+        << "): attempting to evict some operations...";
 
     // TODO: we should also try to evict from other tablets - probably better to evict really old
     // ops from another tablet than evict recent ops from this one.
@@ -183,9 +187,9 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs,
     // Force consuming, so that we don't refuse appending data. We might blow past our limit a
     // little bit (as much as the number of tablets times the amount of in-flight data in the log),
     // but until implementing the above TODO, it's difficult to solve this issue.
-    tracker_->Consume(mem_required);
+    tracker_->Consume(result.mem_required);
 
-    borrowed_memory = parent_tracker_->LimitExceeded();
+    result.borrowed_memory = parent_tracker_->LimitExceeded();
   }
 
   for (auto& e : entries_to_insert) {
@@ -194,24 +198,27 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs,
     next_sequential_op_index_ = index + 1;
   }
 
-  // We drop the lock during the AsyncAppendReplicates call, since it may block if the queue is
-  // full, and the queue might not drain if it's trying to call our callback and blocked on this
-  // lock.
-  l.unlock();
+  return result;
+}
 
-  metrics_.log_cache_size->IncrementBy(mem_required);
-  metrics_.log_cache_num_ops->IncrementBy(msgs.size());
+Status LogCache::AppendOperations(const ReplicateMsgs& msgs, const yb::OpId& committed_op_id,
+                                  RestartSafeCoarseTimePoint batch_mono_time,
+                                  const StatusCallback& callback) {
+  PrepareAppendResult prepare_result;
+  if (!msgs.empty()) {
+    prepare_result = VERIFY_RESULT(PrepareAppendOperations(msgs));
+    metrics_.log_cache_size->IncrementBy(prepare_result.mem_required);
+    metrics_.log_cache_num_ops->IncrementBy(msgs.size());
+  }
 
   Status log_status = log_->AsyncAppendReplicates(
-    msgs, Bind(&LogCache::LogCallback,
-               Unretained(this),
-               last_idx_in_batch,
-               borrowed_memory,
-               callback));
+    msgs, committed_op_id, batch_mono_time,
+    Bind(&LogCache::LogCallback, Unretained(this), prepare_result.last_idx_in_batch,
+         prepare_result.borrowed_memory, callback));
 
   if (!log_status.ok()) {
     LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Couldn't append to log: " << log_status.ToString();
-    tracker_->Release(mem_required);
+    tracker_->Release(prepare_result.mem_required);
     return log_status;
   }
 
@@ -286,18 +293,33 @@ int64_t TotalByteSizeForMessage(const ReplicateMsg& msg) {
 Status LogCache::ReadOps(int64_t after_op_index,
                          int max_size_bytes,
                          ReplicateMsgs* messages,
-                         OpId* preceding_op) {
+                         OpId* preceding_op,
+                         bool* have_more_messages) {
+  return ReadOps(after_op_index, 0 /* to_op_index */, max_size_bytes,
+                 messages, preceding_op, have_more_messages);
+}
+
+Status LogCache::ReadOps(int64_t after_op_index,
+                         int64_t to_op_index,
+                         int max_size_bytes,
+                         ReplicateMsgs* messages,
+                         OpId* preceding_op,
+                         bool* have_more_messages) {
   DCHECK_ONLY_NOTNULL(messages);
   DCHECK_ONLY_NOTNULL(preceding_op);
   DCHECK_GE(after_op_index, 0);
   RETURN_NOT_OK(LookupOpId(after_op_index, preceding_op));
+  if (have_more_messages) {
+    *have_more_messages = false;
+  }
 
   std::unique_lock<simple_spinlock> l(lock_);
   int64_t next_index = after_op_index + 1;
+  int64_t to_index = to_op_index > 0 ? to_op_index + 1 : next_sequential_op_index_;
 
-  // Return as many operations as we can, up to the limit
+  // Return as many operations as we can, up to the limit.
   int64_t remaining_space = max_size_bytes;
-  while (remaining_space > 0 && next_index < next_sequential_op_index_) {
+  while (remaining_space > 0 && next_index < to_index) {
 
     // If the messages the peer needs haven't been loaded into the queue yet, load them.
     MessageCache::const_iterator iter = cache_.lower_bound(next_index);
@@ -305,10 +327,10 @@ Status LogCache::ReadOps(int64_t after_op_index,
       int64_t up_to;
       if (iter == cache_.end()) {
         // Read all the way to the current op.
-        up_to = next_sequential_op_index_ - 1;
+        up_to = to_index - 1;
       } else {
-        // Read up to the next entry that's in the cache.
-        up_to = iter->first - 1;
+        // Read up to the next entry that's in the cache or to_index whichever is lesser.
+        up_to = std::min(iter->first - 1, static_cast<uint64_t>(to_index - 1));
       }
 
       l.unlock();
@@ -319,8 +341,8 @@ Status LogCache::ReadOps(int64_t after_op_index,
             next_index, up_to, remaining_space, &raw_replicate_ptrs),
         Substitute("Failed to read ops $0..$1", next_index, up_to));
       l.lock();
-      LOG_WITH_PREFIX_UNLOCKED(INFO) << "Successfully read " << raw_replicate_ptrs.size() << " ops "
-                            << "from disk.";
+      LOG_WITH_PREFIX_UNLOCKED(INFO)
+          << "Successfully read " << raw_replicate_ptrs.size() << " ops from disk.";
 
       for (auto& msg : raw_replicate_ptrs) {
         CHECK_EQ(next_index, msg->id().index());
@@ -329,12 +351,17 @@ Status LogCache::ReadOps(int64_t after_op_index,
         if (remaining_space > 0 || messages->empty()) {
           messages->push_back(msg);
           next_index++;
+        } else if (have_more_messages) {
+          *have_more_messages = true;
         }
       }
 
     } else {
       // Pull contiguous messages from the cache until the size limit is achieved.
       for (; iter != cache_.end(); ++iter) {
+        if (to_op_index > 0 && next_index > to_op_index) {
+          break;
+        }
         const ReplicateMsgPtr& msg = iter->second.msg;
         int64_t index = msg->id().index();
         if (index != next_index) {
@@ -343,6 +370,9 @@ Status LogCache::ReadOps(int64_t after_op_index,
 
         remaining_space -= TotalByteSizeForMessage(*msg);
         if (remaining_space < 0 && !messages->empty()) {
+          if (have_more_messages) {
+            *have_more_messages = true;
+          }
           break;
         }
 
@@ -353,7 +383,6 @@ Status LogCache::ReadOps(int64_t after_op_index,
   }
   return Status::OK();
 }
-
 
 void LogCache::EvictThroughOp(int64_t index) {
   std::lock_guard<simple_spinlock> lock(lock_);

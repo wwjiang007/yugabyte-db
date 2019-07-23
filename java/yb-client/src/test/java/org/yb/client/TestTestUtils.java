@@ -40,6 +40,8 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.yb.AssertionWrappers.assertEquals;
@@ -51,6 +53,7 @@ import static org.yb.AssertionWrappers.assertTrue;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.yb.util.ProcessUtil;
 
 @RunWith(value=YBTestRunner.class)
 public class TestTestUtils {
@@ -79,14 +82,14 @@ public class TestTestUtils {
     Thread thread = new Thread(lineCounter);
     thread.setDaemon(true);
     thread.start();
-    TestUtils.pauseProcess(proc);
+    ProcessUtil.pauseProcess(proc);
     long prevCount;
     do {
       prevCount = lineCounter.getCount();
       Thread.sleep(10);
     } while (prevCount != lineCounter.getCount());
     assertEquals(prevCount, lineCounter.getCount());
-    TestUtils.resumeProcess(proc);
+    ProcessUtil.resumeProcess(proc);
     do {
       prevCount = lineCounter.getCount();
       Thread.sleep(10);

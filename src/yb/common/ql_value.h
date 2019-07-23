@@ -84,6 +84,10 @@ class QLValue {
     CHECK(pb_.has_int64_value()) << "Value: " << pb_.ShortDebugString();
     return pb_.int64_value();
   }
+  virtual uint32_t uint32_value() const {
+    CHECK(pb_.has_uint32_value()) << "Value: " << pb_.ShortDebugString();
+    return pb_.uint32_value();
+  }
   virtual float float_value() const {
     CHECK(pb_.has_float_value()) << "Value: " << pb_.ShortDebugString();
     return pb_.float_value();
@@ -92,6 +96,7 @@ class QLValue {
     CHECK(pb_.has_double_value()) << "Value: " << pb_.ShortDebugString();
     return pb_.double_value();
   }
+  // Returns a serialized binary representation of a decimal, not a plaintext
   virtual const std::string& decimal_value() const {
     CHECK(pb_.has_decimal_value()) << "Value: " << pb_.ShortDebugString();
     return pb_.decimal_value();
@@ -112,6 +117,14 @@ class QLValue {
     // Caller of this function should already read and know the PB value type before calling.
     DCHECK(pb_.has_timestamp_value()) << "Value: " << pb_.ShortDebugString();
     return pb_.timestamp_value();
+  }
+  virtual uint32_t date_value() const {
+    CHECK(pb_.has_date_value()) << "Value: " << pb_.ShortDebugString();
+    return pb_.date_value();
+  }
+  virtual int64_t time_value() const {
+    CHECK(pb_.has_time_value()) << "Value: " << pb_.ShortDebugString();
+    return pb_.time_value();
   }
   virtual const std::string& binary_value() const {
     CHECK(pb_.has_binary_value()) << "Value: " << pb_.ShortDebugString();
@@ -196,15 +209,20 @@ class QLValue {
   virtual void set_int64_value(int64_t val) {
     pb_.set_int64_value(val);
   }
+  virtual void set_uint32_value(uint32_t val) {
+    pb_.set_uint32_value(val);
+  }
   virtual void set_float_value(float val) {
     pb_.set_float_value(val);
   }
   virtual void set_double_value(double val) {
     pb_.set_double_value(val);
   }
+  // val is a serialized binary representation of a decimal, not a plaintext
   virtual void set_decimal_value(const std::string& val) {
     pb_.set_decimal_value(val);
   }
+  // val is a serialized binary representation of a decimal, not a plaintext
   virtual void set_decimal_value(std::string&& val) {
     pb_.set_decimal_value(std::move(val));
   }
@@ -231,6 +249,12 @@ class QLValue {
   }
   virtual void set_timestamp_value(int64_t val) {
     pb_.set_timestamp_value(val);
+  }
+  virtual void set_date_value(uint32_t val) {
+    pb_.set_date_value(val);
+  }
+  virtual void set_time_value(int64_t val) {
+    pb_.set_time_value(val);
   }
   virtual void set_binary_value(const std::string& val) {
     pb_.set_binary_value(val);
@@ -346,28 +370,35 @@ class QLValue {
   virtual bool BothNotNull(const QLValue& other) const {
     return !IsNull() && !other.IsNull();
   }
+  virtual bool BothNull(const QLValue& other) const {
+    return IsNull() && other.IsNull();
+  }
   virtual bool EitherIsNull(const QLValue& other) const {
     return IsNull() || other.IsNull();
   }
 
   virtual int CompareTo(const QLValue& other) const;
+
+  // In YCQL null is not comparable with regular values (w.r.t. ordering).
   virtual bool operator <(const QLValue& v) const {
     return BothNotNull(v) && CompareTo(v) < 0;
   }
   virtual bool operator >(const QLValue& v) const {
     return BothNotNull(v) && CompareTo(v) > 0;
   }
+
+  // In YCQL equality holds for null values.
   virtual bool operator <=(const QLValue& v) const {
-    return BothNotNull(v) && CompareTo(v) <= 0;
+    return (BothNotNull(v) && CompareTo(v) <= 0) || BothNull(v);
   }
   virtual bool operator >=(const QLValue& v) const {
-    return BothNotNull(v) && CompareTo(v) >= 0;
+    return (BothNotNull(v) && CompareTo(v) >= 0) || BothNull(v);
   }
   virtual bool operator ==(const QLValue& v) const {
-    return BothNotNull(v) && CompareTo(v) == 0;
+    return (BothNotNull(v) && CompareTo(v) == 0) || BothNull(v);
   }
   virtual bool operator !=(const QLValue& v) const {
-    return BothNotNull(v) && CompareTo(v) != 0;
+    return !(*this == v);
   }
 
   //----------------------------- serializer / deserializer ---------------------------------
@@ -438,11 +469,13 @@ bool IsNull(const QLValuePB& v);
 void SetNull(QLValuePB* v);
 bool EitherIsNull(const QLValuePB& lhs, const QLValuePB& rhs);
 bool BothNotNull(const QLValuePB& lhs, const QLValuePB& rhs);
+bool BothNull(const QLValuePB& lhs, const QLValuePB& rhs);
 bool Comparable(const QLValuePB& lhs, const QLValuePB& rhs);
 int Compare(const QLValuePB& lhs, const QLValuePB& rhs);
 bool EitherIsNull(const QLValuePB& lhs, const QLValue& rhs);
 bool Comparable(const QLValuePB& lhs, const QLValue& rhs);
 bool BothNotNull(const QLValuePB& lhs, const QLValue& rhs);
+bool BothNull(const QLValuePB& lhs, const QLValue& rhs);
 int Compare(const QLValuePB& lhs, const QLValue& rhs);
 int Compare(const QLSeqValuePB& lhs, const QLSeqValuePB& rhs);
 int Compare(const bool lhs, const bool rhs);

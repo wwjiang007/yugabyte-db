@@ -44,7 +44,8 @@ set(MASTER_YRPC_LIBS
   rpc_header_proto
   tablet_proto
   tserver_proto
-  wire_protocol_proto)
+  wire_protocol_proto
+  yb_pgwrapper)
 ADD_YB_LIBRARY(master_proto
   SRCS ${MASTER_YRPC_SRCS}
   DEPS ${MASTER_YRPC_LIBS}
@@ -60,7 +61,12 @@ set(MASTER_SRCS
   call_home.cc
   catalog_manager.cc
   catalog_manager_util.cc
+  catalog_entity_info.cc
+  catalog_manager_bg_tasks.cc
+  catalog_loaders.cc
+  scoped_leader_shared_lock.cc
   cluster_balance.cc
+  permissions_manager.cc
   flush_manager.cc
   master.cc
   master_options.cc
@@ -71,8 +77,9 @@ set(MASTER_SRCS
   master-path-handlers.cc
   mini_master.cc
   sys_catalog.cc
+  initial_sys_catalog_snapshot.cc
   system_tablet.cc
-  system_tables_handler.cc
+  tasks_tracker.cc
   ts_descriptor.cc
   ts_manager.cc
   yql_virtual_table.cc
@@ -111,7 +118,8 @@ target_link_libraries(master
   ${MASTER_PROTO_LIBS}
   rpc_header_proto
   master_util
-  version_info_proto)
+  version_info_proto
+  yb_pggate_flags)
 
 set(MASTER_RPC_SRCS
   master_rpc.cc)

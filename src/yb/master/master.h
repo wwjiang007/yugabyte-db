@@ -49,6 +49,7 @@
 #include "yb/util/metrics.h"
 #include "yb/util/promise.h"
 #include "yb/util/status.h"
+#include "yb/yql/pgwrapper/pg_wrapper.h"
 
 namespace yb {
 
@@ -146,11 +147,10 @@ class Master : public server::RpcAndWebServerBase {
   // Called currently by cluster master leader which is removing this master from the quorum.
   CHECKED_STATUS GoIntoShellMode();
 
-  // Returns the number of system tables (used only for testing currently).
-  size_t NumSystemTables() const;
-
  protected:
   virtual CHECKED_STATUS RegisterServices();
+
+  void DisplayGeneralInfoIcons(std::stringstream* output);
 
  private:
   friend class MasterTest;

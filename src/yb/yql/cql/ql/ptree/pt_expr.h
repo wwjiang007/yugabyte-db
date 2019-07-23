@@ -27,7 +27,7 @@
 #include "yb/yql/cql/ql/ptree/sem_state.h"
 
 #include "yb/common/ql_value.h"
-#include "yb/util/bfql/bfql.h"
+#include "yb/util/bfql/tserver_opcodes.h"
 
 namespace yb {
 namespace ql {
@@ -100,15 +100,21 @@ class PTExpr : public TreeNode {
       yb::QLOperator ql_op = yb::QLOperator::QL_OP_NOOP,
       InternalType internal_type = InternalType::VALUE_NOT_SET,
       DataType ql_type_id = DataType::UNKNOWN_DATA)
+      : PTExpr(memctx, loc, op, ql_op, internal_type, QLType::Create(ql_type_id)) {}
+  explicit PTExpr(
+      MemoryContext *memctx,
+      YBLocation::SharedPtr loc,
+      ExprOperator op,
+      yb::QLOperator ql_op,
+      InternalType internal_type,
+      const QLType::SharedPtr& ql_type)
       : TreeNode(memctx, loc),
         op_(op),
         ql_op_(ql_op),
         internal_type_(internal_type),
-        ql_type_(QLType::Create(ql_type_id)),
-        expected_internal_type_(InternalType::VALUE_NOT_SET) {
-  }
-  virtual ~PTExpr() {
-  }
+        ql_type_(ql_type),
+        expected_internal_type_(InternalType::VALUE_NOT_SET) {}
+  virtual ~PTExpr() {}
 
   // Expression return type in DocDB format.
   virtual InternalType internal_type() const {
@@ -128,6 +134,12 @@ class PTExpr : public TreeNode {
   // Expression return type in QL format.
   virtual const std::shared_ptr<QLType>& ql_type() const {
     return ql_type_;
+  }
+
+  // This is only useful during pre-exec phase.
+  // Normally you'd want to use CheckExpectedTypeCompatibility instead.
+  virtual void set_expected_internal_type(InternalType expected_internal_type) {
+    expected_internal_type_ = expected_internal_type;
   }
 
   // Expression return result set column type in QL format.
@@ -281,7 +293,7 @@ class PTExpr : public TreeNode {
   ExprOperator op_;
   yb::QLOperator ql_op_;
   InternalType internal_type_;
-  std::shared_ptr<QLType> ql_type_;
+  QLType::SharedPtr ql_type_;
   InternalType expected_internal_type_;
 };
 
@@ -300,12 +312,14 @@ class PTCollectionExpr : public PTExpr {
 
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  PTCollectionExpr(MemoryContext *memctx, YBLocation::SharedPtr loc, DataType literal_type)
+  PTCollectionExpr(MemoryContext* memctx,
+                   YBLocation::SharedPtr loc,
+                   const QLType::SharedPtr& ql_type)
       : PTExpr(memctx, loc, ExprOperator::kCollection, yb::QLOperator::QL_OP_NOOP,
-      client::YBColumnSchema::ToInternalDataType(QLType::Create(literal_type))),
-        keys_(memctx), values_(memctx), udtype_field_values_(memctx) {
-    ql_type_ = QLType::Create(literal_type);
-  }
+               client::YBColumnSchema::ToInternalDataType(ql_type), ql_type),
+        keys_(memctx), values_(memctx), udtype_field_values_(memctx) {}
+  PTCollectionExpr(MemoryContext* memctx, YBLocation::SharedPtr loc, DataType literal_type)
+      : PTCollectionExpr(memctx, loc, QLType::Create(literal_type)) {}
   virtual ~PTCollectionExpr() { }
 
   void AddKeyValuePair(PTExpr::SharedPtr key, PTExpr::SharedPtr value) {
@@ -316,6 +330,10 @@ class PTCollectionExpr : public PTExpr {
   void AddElement(PTExpr::SharedPtr value) {
     values_.emplace_back(value);
   }
+
+  // Fill in udtype_field_values collection, copying values in accordance to UDT field order
+  CHECKED_STATUS InitializeUDTValues(const QLType::SharedPtr& expected_type,
+                                     ProcessContextBase* process_context);
 
   int size() const {
     return static_cast<int>(values_.size());
@@ -610,6 +628,10 @@ class PTLiteral {
     return std::to_string(value);
   }
 
+  virtual string ToQLName(uint32_t value) const {
+    return std::to_string(value);
+  }
+
   virtual string ToQLName(long double value) const {
     return std::to_string(value);
   }
@@ -723,8 +745,12 @@ class PTLiteralString : public PTLiteral<MCSharedPtr<MCString>> {
   CHECKED_STATUS ToDecimal(std::string *value, bool negate) const;
   CHECKED_STATUS ToVarInt(std::string *value, bool negate) const;
 
+  std::string ToString() const;
+
   CHECKED_STATUS ToString(std::string *value) const;
   CHECKED_STATUS ToTimestamp(int64_t *value) const;
+  CHECKED_STATUS ToDate(uint32_t *value) const;
+  CHECKED_STATUS ToTime(int64_t *value) const;
 
   CHECKED_STATUS ToInetaddress(InetAddress *value) const;
 };
@@ -774,6 +800,14 @@ using PTConstDouble = PTExprConst<InternalType::kDoubleValue,
 using PTConstFloat = PTExprConst<InternalType::kFloatValue,
                                  DataType::FLOAT,
                                  float>;
+
+using PTConstTimestamp = PTExprConst<InternalType::kTimestampValue,
+                                     DataType::TIMESTAMP,
+                                     int64_t>;
+
+using PTConstDate = PTExprConst<InternalType::kDateValue,
+                                DataType::DATE,
+                                uint32_t>;
 
 // Class representing a json operator.
 class PTJsonOperator : public PTExpr {
@@ -909,7 +943,7 @@ class PTOperatorExpr : public PTExpr {
   virtual CHECKED_STATUS AnalyzeOperator(SemContext *sem_context, PTExpr::SharedPtr op1) override;
 
  protected:
-  // Get the column descriptor from the current DML statement.
+  // Get the column descriptor from the current statement.
   const ColumnDesc *GetColumnDesc(const SemContext *sem_context, const MCString& col_name) const;
 };
 
@@ -1029,6 +1063,10 @@ class PTJsonColumnWithOperators : public PTOperator0 {
   // Analyze LHS expression.
   virtual CHECKED_STATUS CheckLhsExpr(SemContext *sem_context) override;
 
+  CHECKED_STATUS SetupPrimaryKey(SemContext *sem_context) const;
+  CHECKED_STATUS SetupHashAndPrimaryKey(SemContext *sem_context) const;
+  CHECKED_STATUS SetupCoveringIndexColumn(SemContext *sem_context) const;
+
  private:
   PTQualifiedName::SharedPtr name_;
   PTExprListNode::SharedPtr operators_;
@@ -1133,7 +1171,7 @@ class PTAllColumns : public PTOperator0 {
   virtual string QLName() const override {
     // We should not get here as '*' should have been converted into a list of column name before
     // the selected tuple is constructed and described.
-    LOG(FATAL) << "Calling QLName for '*' is not expected";
+    LOG(DFATAL) << "Calling QLName for '*' is not expected";
     return "*";
   }
 
@@ -1268,6 +1306,11 @@ class PTBindVar : public PTExpr {
   // Node type.
   virtual TreeNodeOpcode opcode() const override {
     return TreeNodeOpcode::kPTBindVar;
+  }
+
+  virtual string QLName() const override {
+    string qlname = (user_pos_) ? user_pos_->ToString() : name()->c_str();
+    return ":" +  qlname;
   }
 
   // Access to op_.

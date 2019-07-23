@@ -13,17 +13,25 @@
 //
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/exec/executor.h"
 #include "yb/yql/cql/ql/ql_processor.h"
-#include "yb/client/client.h"
+
 #include "yb/client/callbacks.h"
+#include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/common/common.pb.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/rpc/thread_pool.h"
 #include "yb/util/decimal.h"
 #include "yb/util/logging.h"
+#include "yb/util/random_util.h"
 #include "yb/util/thread_restrictions.h"
 #include "yb/util/trace.h"
 
@@ -35,21 +43,19 @@ using std::shared_ptr;
 using namespace std::placeholders;
 
 using client::YBColumnSpec;
+using client::YBOperation;
+using client::YBqlOpPtr;
+using client::YBqlReadOp;
+using client::YBqlReadOpPtr;
+using client::YBqlWriteOp;
+using client::YBqlWriteOpPtr;
 using client::YBSchema;
 using client::YBSchemaBuilder;
-using client::YBTable;
-using client::YBTableCreator;
-using client::YBTableAlterer;
-using client::YBTableType;
-using client::YBTableName;
 using client::YBSessionPtr;
-using client::YBOperation;
-using client::YBqlOp;
-using client::YBqlReadOp;
-using client::YBqlWriteOp;
-using client::YBqlOpPtr;
-using client::YBqlReadOpPtr;
-using client::YBqlWriteOpPtr;
+using client::YBTableAlterer;
+using client::YBTableCreator;
+using client::YBTableName;
+using client::YBTableType;
 using strings::Substitute;
 
 #define RETURN_STMT_NOT_OK(s) do {                                         \
@@ -59,9 +65,9 @@ using strings::Substitute;
 
 //--------------------------------------------------------------------------------------------------
 
-Executor::Executor(QLEnv *ql_env, Rescheduler rescheduler, const QLMetrics* ql_metrics)
+Executor::Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics)
     : ql_env_(ql_env),
-      rescheduler_(std::move(rescheduler)),
+      rescheduler_(rescheduler),
       session_(ql_env_->NewSession()),
       ql_metrics_(ql_metrics) {
 }
@@ -75,7 +81,13 @@ void Executor::ExecuteAsync(const ParseTree& parse_tree, const StatementParamete
                             StatementExecutedCallback cb) {
   DCHECK(cb_.is_null()) << "Another execution is in progress.";
   cb_ = std::move(cb);
-  session_->SetReadPoint(client::Restart::kFalse);
+  session_->SetForceConsistentRead(client::ForceConsistentRead::kFalse);
+  auto read_time = params.read_time();
+  if (read_time) {
+    session_->SetReadPoint(read_time);
+  } else {
+    session_->SetReadPoint(client::Restart::kFalse);
+  }
   RETURN_STMT_NOT_OK(Execute(parse_tree, params));
   FlushAsync();
 }
@@ -83,6 +95,7 @@ void Executor::ExecuteAsync(const ParseTree& parse_tree, const StatementParamete
 void Executor::ExecuteAsync(const StatementBatch& batch, StatementExecutedCallback cb) {
   DCHECK(cb_.is_null()) << "Another execution is in progress.";
   cb_ = std::move(cb);
+  session_->SetForceConsistentRead(client::ForceConsistentRead::kFalse);
   session_->SetReadPoint(client::Restart::kFalse);
 
   // Table for DML batches, where all statements must modify the same table.
@@ -159,7 +172,30 @@ Status Executor::Execute(const ParseTree& parse_tree, const StatementParameters&
   // Prepare execution context and execute the parse tree's root node.
   exec_contexts_.emplace_back(parse_tree, params);
   exec_context_ = &exec_contexts_.back();
-  return ProcessStatementStatus(parse_tree, ExecTreeNode(parse_tree.root().get()));
+  auto root_node = parse_tree.root().get();
+  RETURN_NOT_OK(PreExecTreeNode(root_node));
+  return ProcessStatementStatus(parse_tree, ExecTreeNode(root_node));
+}
+
+//--------------------------------------------------------------------------------------------------
+
+Status Executor::PreExecTreeNode(TreeNode *tnode) {
+  if (!tnode) {
+    return Status::OK();
+  } else if (tnode->opcode() == TreeNodeOpcode::kPTInsertStmt) {
+    return PreExecTreeNode(static_cast<PTInsertStmt*>(tnode));
+  } else {
+    return Status::OK();
+  }
+}
+
+Status Executor::PreExecTreeNode(PTInsertStmt *tnode) {
+  if (tnode->InsertingValue()->opcode() == TreeNodeOpcode::kPTInsertJsonClause) {
+    // We couldn't resolve JSON clause bind variable until now
+    return PreExecTreeNode(static_cast<PTInsertJsonClause*>(tnode->InsertingValue().get()));
+  } else {
+    return Status::OK();
+  }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -172,7 +208,7 @@ Status Executor::ExecTreeNode(const TreeNode *tnode) {
   if (tnode->opcode() != TreeNodeOpcode::kPTListNode) {
     tnode_context = exec_context_->AddTnode(tnode);
     if (tnode->IsDml() && static_cast<const PTDmlStmt *>(tnode)->RequiresTransaction()) {
-      exec_context_->StartTransaction(SNAPSHOT_ISOLATION, ql_env_);
+      RETURN_NOT_OK(exec_context_->StartTransaction(SNAPSHOT_ISOLATION, ql_env_));
     }
   }
   switch (tnode->opcode()) {
@@ -231,6 +267,12 @@ Status Executor::ExecTreeNode(const TreeNode *tnode) {
     case TreeNodeOpcode::kPTUseKeyspace:
       return ExecPTNode(static_cast<const PTUseKeyspace *>(tnode));
 
+    case TreeNodeOpcode::kPTAlterKeyspace:
+      return ExecPTNode(static_cast<const PTAlterKeyspace *>(tnode));
+
+    case TreeNodeOpcode::kPTExplainStmt:
+      return ExecPTNode(static_cast<const PTExplainStmt *>(tnode));
+
     default:
       return exec_context_->Error(tnode, ErrorCode::FEATURE_NOT_SUPPORTED);
   }
@@ -243,11 +285,14 @@ Status Executor::ExecPTNode(const PTCreateRole *tnode) {
     ErrorCode error_code = ErrorCode::SERVER_ERROR;
     if (s.IsAlreadyPresent()) {
       error_code = ErrorCode::DUPLICATE_ROLE;
+    } else if (s.IsNotAuthorized()) {
+      error_code = ErrorCode::UNAUTHORIZED;
     }
 
     if (tnode->create_if_not_exists() && error_code == ErrorCode::DUPLICATE_ROLE) {
       return Status::OK();
     }
+
     // TODO (Bristy) : Set result_ properly.
     return exec_context_->Error(tnode, s, error_code);
   }
@@ -262,6 +307,9 @@ Status Executor::ExecPTNode(const PTAlterRole *tnode) {
                                       tnode->superuser());
   if (PREDICT_FALSE(!s.ok())) {
     ErrorCode error_code = ErrorCode::ROLE_NOT_FOUND;
+    if (s.IsNotAuthorized()) {
+      error_code = ErrorCode::UNAUTHORIZED;
+    }
     return exec_context_->Error(tnode, s, error_code);
   }
 
@@ -351,16 +399,19 @@ Status Executor::ExecPTNode(const PTCreateTable *tnode) {
     if (column->sorting_type() != ColumnSchema::SortingType::kNotSpecified) {
       return exec_context_->Error(tnode->columns().front(), s, ErrorCode::INVALID_TABLE_DEFINITION);
     }
-    b.AddColumn(column->yb_name())->Type(column->ql_type())
-        ->HashPrimaryKey()
-        ->Order(column->order());
+
+    YBColumnSpec *column_spec = b.AddColumn(column->yb_name())->Type(column->ql_type())
+                                ->HashPrimaryKey()
+                                ->Order(column->order());
+    RETURN_NOT_OK(ColumnOpsToSchema(column, column_spec));
   }
   const MCList<PTColumnDefinition *>& primary_columns = tnode->primary_columns();
   for (const auto& column : primary_columns) {
-    b.AddColumn(column->yb_name())->Type(column->ql_type())
-        ->PrimaryKey()
-        ->Order(column->order())
-        ->SetSortingType(column->sorting_type());
+    YBColumnSpec *column_spec = b.AddColumn(column->yb_name())->Type(column->ql_type())
+                                ->PrimaryKey()
+                                ->Order(column->order())
+                                ->SetSortingType(column->sorting_type());
+    RETURN_NOT_OK(ColumnOpsToSchema(column, column_spec));
   }
   const MCList<PTColumnDefinition *>& columns = tnode->columns();
   for (const auto& column : columns) {
@@ -376,6 +427,7 @@ Status Executor::ExecPTNode(const PTCreateTable *tnode) {
     if (column->is_counter()) {
       column_spec->Counter();
     }
+    RETURN_NOT_OK(ColumnOpsToSchema(column, column_spec));
   }
 
   TableProperties table_properties;
@@ -394,6 +446,7 @@ Status Executor::ExecPTNode(const PTCreateTable *tnode) {
   shared_ptr<YBTableCreator> table_creator(ql_env_->NewTableCreator());
   table_creator->table_name(table_name)
       .table_type(YBTableType::YQL_TABLE_TYPE)
+      .creator_role_name(ql_env_->CurrentRoleName())
       .schema(&schema);
   if (tnode->opcode() == TreeNodeOpcode::kPTCreateIndex) {
     const PTCreateIndex *index_node = static_cast<const PTCreateIndex*>(tnode);
@@ -405,16 +458,16 @@ Status Executor::ExecPTNode(const PTCreateTable *tnode) {
   if (PREDICT_FALSE(!s.ok())) {
     ErrorCode error_code = ErrorCode::SERVER_ERROR;
     if (s.IsAlreadyPresent()) {
-      error_code = ErrorCode::DUPLICATE_TABLE;
+      error_code = ErrorCode::DUPLICATE_OBJECT;
     } else if (s.IsNotFound()) {
       error_code = tnode->opcode() == TreeNodeOpcode::kPTCreateIndex
-                   ? ErrorCode::TABLE_NOT_FOUND
+                   ? ErrorCode::OBJECT_NOT_FOUND
                    : ErrorCode::KEYSPACE_NOT_FOUND;
     } else if (s.IsInvalidArgument()) {
       error_code = ErrorCode::INVALID_TABLE_DEFINITION;
     }
 
-    if (tnode->create_if_not_exists() && error_code == ErrorCode::DUPLICATE_TABLE) {
+    if (tnode->create_if_not_exists() && error_code == ErrorCode::DUPLICATE_OBJECT) {
       return Status::OK();
     }
 
@@ -492,7 +545,7 @@ Status Executor::ExecPTNode(const PTDropStmt *tnode) {
       // Drop the table.
       const YBTableName table_name = tnode->yb_table_name();
       s = ql_env_->DeleteTable(table_name);
-      error_not_found = ErrorCode::TABLE_NOT_FOUND;
+      error_not_found = ErrorCode::OBJECT_NOT_FOUND;
       result_ = std::make_shared<SchemaChangeResult>(
           "DROPPED", "TABLE", table_name.namespace_name(), table_name.table_name());
       ql_env_->RemoveCachedTableDesc(table_name);
@@ -504,7 +557,7 @@ Status Executor::ExecPTNode(const PTDropStmt *tnode) {
       const YBTableName table_name = tnode->yb_table_name();
       YBTableName indexed_table_name;
       s = ql_env_->DeleteIndexTable(table_name, &indexed_table_name);
-      error_not_found = ErrorCode::TABLE_NOT_FOUND;
+      error_not_found = ErrorCode::OBJECT_NOT_FOUND;
       result_ = std::make_shared<SchemaChangeResult>(
           "UPDATED", "TABLE", indexed_table_name.namespace_name(), indexed_table_name.table_name());
       ql_env_->RemoveCachedTableDesc(indexed_table_name);
@@ -554,6 +607,8 @@ Status Executor::ExecPTNode(const PTDropStmt *tnode) {
       }
 
       error_code = error_not_found;
+    } else if (s.IsNotAuthorized()) {
+      error_code = ErrorCode::UNAUTHORIZED;
     }
 
     return exec_context_->Error(tnode->name(), s, error_code);
@@ -627,15 +682,28 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
     // If this is a system table but the table does not exist, it is okay. Just return OK with void
     // result.
     return tnode->is_system() ? Status::OK()
-                              : exec_context_->Error(tnode, ErrorCode::TABLE_NOT_FOUND);
+                              : exec_context_->Error(tnode, ErrorCode::OBJECT_NOT_FOUND);
   }
 
   const StatementParameters& params = exec_context_->params();
-  // If there is a table id in the statement parameter's paging state, this is a continuation of
-  // a prior SELECT statement. Verify that the same table still exists.
-  const bool continue_select = !params.table_id().empty();
+  // If there is a table id in the statement parameter's paging state, this is a continuation of a
+  // prior SELECT statement. Verify that the same table/index still exists and matches the table id
+  // for query without index, or the index id in the leaf node (where child_select is null also).
+  const bool continue_select = !tnode->child_select() && !params.table_id().empty();
   if (continue_select && params.table_id() != table->id()) {
-    return exec_context_->Error(tnode, "Table no longer exists.", ErrorCode::TABLE_NOT_FOUND);
+    return exec_context_->Error(tnode, "Object no longer exists.", ErrorCode::OBJECT_NOT_FOUND);
+  }
+
+  // If there is an index to select from, execute it.
+  if (tnode->child_select()) {
+    const PTSelectStmt* child_select = tnode->child_select().get();
+    TnodeContext* child_context = tnode_context->AddChildTnode(child_select);
+    RETURN_NOT_OK(ExecPTNode(child_select, child_context));
+    // If the index covers the SELECT query fully, we are done. Otherwise, continue to prepare
+    // the SELECT from the table using the primary key to be returned from the index select.
+    if (child_select->covers_fully()) {
+      return Status::OK();
+    }
   }
 
   // Create the read request.
@@ -700,8 +768,11 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
 
   // Default row count limit is the page size.
   // We should return paging state when page size limit is hit.
-  req->set_limit(params.page_size());
-  req->set_return_paging_state(true);
+  // For system tables, we do not support page size so do nothing.
+  if (!tnode->is_system()) {
+    req->set_limit(params.page_size());
+    req->set_return_paging_state(true);
+  }
 
   // Check if there is a limit and compute the new limit based on the number of returned rows.
   if (tnode->limit()) {
@@ -719,7 +790,7 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
     // the page size limit set from above, set the lower limit and do not return paging state when
     // this limit is hit.
     limit -= params.total_num_rows_read();
-    if (limit <= req->limit()) {
+    if (!req->has_limit() || limit <= req->limit()) {
       req->set_limit(limit);
       req->set_return_paging_state(false);
     }
@@ -776,6 +847,17 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
     }
   }
 
+  // If this select statement uses an uncovered index underneath, save this op as a template to
+  // read from the table once the primary keys are returned from the uncovered index. The paging
+  // state should be used by the underlying select from the index only which decides where to
+  // continue the select from the index.
+  if (tnode->child_select() && !tnode->child_select()->covers_fully()) {
+    req->clear_return_paging_state();
+    tnode_context->SetUncoveredSelectOp(select_op);
+    result_ = std::make_shared<RowsResult>(select_op.get());
+    return Status::OK();
+  }
+
   // Add the operation.
   return AddOperation(select_op, tnode_context);
 }
@@ -784,20 +866,19 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
                                      const YBqlReadOpPtr& op,
                                      TnodeContext* tnode_context,
                                      ExecContext* exec_context) {
-  if (result_ == nullptr) {
+  RowsResult::SharedPtr current_result = tnode_context->rows_result();
+  if (!current_result) {
     return STATUS(InternalError, "Missing result for SELECT operation");
   }
 
   // Rows read so far: in this fetch, previous fetches (for paging selects), and in total.
-  RowsResult::SharedPtr current_result = std::static_pointer_cast<RowsResult>(result_);
-  const size_t current_fetch_row_count =
-      VERIFY_RESULT(QLRowBlock::GetRowCount(current_result->client(), current_result->rows_data()));
+  const size_t current_fetch_row_count = tnode_context->row_count();
   const size_t previous_fetches_row_count = exec_context->params().total_num_rows_read();
   const size_t total_row_count = previous_fetches_row_count + current_fetch_row_count;
 
   // Statement (paging) parameters.
   StatementParameters current_params;
-  RETURN_NOT_OK(current_params.set_paging_state(current_result->paging_state()));
+  RETURN_NOT_OK(current_params.SetPagingState(current_result->paging_state()));
 
   const size_t total_rows_skipped = exec_context->params().total_rows_skipped() +
                                     current_params.total_rows_skipped();
@@ -810,7 +891,7 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
 
     // If the LIMIT clause has been reached, we are done.
     if (total_row_count >= limit_pb.value().int32_value()) {
-      current_result->clear_paging_state();
+      current_result->ClearPagingState();
       return false;
     }
 
@@ -835,7 +916,7 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
     // If there or no other partitions to query, we are done.
     if (tnode_context->UnreadPartitionsRemaining() <= 1) {
       // Clear the paging state, since we don't have any more data left in the table.
-      current_result->clear_paging_state();
+      current_result->ClearPagingState();
       return false;
     }
 
@@ -867,7 +948,9 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
       paging_state.set_next_partition_key(current_params.next_partition_key());
       paging_state.set_next_row_key(current_params.next_row_key());
 
-      current_result->set_paging_state(paging_state);
+      paging_state.set_original_request_id(exec_context_->params().request_id());
+
+      current_result->SetPagingState(paging_state);
     }
 
     return false;
@@ -895,6 +978,23 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
   return true;
 }
 
+
+Result<bool> Executor::FetchRowsByKeys(const PTSelectStmt* tnode,
+                                       const YBqlReadOpPtr& select_op,
+                                       const QLRowBlock& keys,
+                                       TnodeContext* tnode_context) {
+  const Schema& schema = tnode->table()->InternalSchema();
+  for (const QLRow& key : keys.rows()) {
+    YBqlReadOpPtr op(tnode->table()->NewQLSelect());
+    op->set_yb_consistency_level(select_op->yb_consistency_level());
+    QLReadRequestPB* req = op->mutable_request();
+    req->CopyFrom(select_op->request());
+    RETURN_NOT_OK(WhereKeyToPB(req, schema, key));
+    RETURN_NOT_OK(AddOperation(op, tnode_context));
+  }
+  return !keys.rows().empty();
+}
+
 //--------------------------------------------------------------------------------------------------
 
 Status Executor::ExecPTNode(const PTInsertStmt *tnode, TnodeContext* tnode_context) {
@@ -916,9 +1016,17 @@ Status Executor::ExecPTNode(const PTInsertStmt *tnode, TnodeContext* tnode_conte
   }
 
   // Set the values for columns.
-  s = ColumnArgsToPB(tnode, req);
-  if (PREDICT_FALSE(!s.ok())) {
-    return exec_context_->Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);
+  if (tnode->InsertingValue()->opcode() == TreeNodeOpcode::kPTInsertJsonClause) {
+    // Error messages are already formatted and don't need additional wrap
+    RETURN_NOT_OK(
+        InsertJsonClauseToPB(tnode,
+                             static_cast<PTInsertJsonClause*>(tnode->InsertingValue().get()),
+                             req));
+  } else {
+    s = ColumnArgsToPB(tnode, req);
+    if (PREDICT_FALSE(!s.ok())) {
+      return exec_context_->Error(tnode, s, ErrorCode::INVALID_ARGUMENTS);
+    }
   }
 
   // Setup the column values that need to be read.
@@ -1068,8 +1176,7 @@ Status Executor::ExecPTNode(const PTUpdateStmt *tnode, TnodeContext* tnode_conte
 //--------------------------------------------------------------------------------------------------
 
 Status Executor::ExecPTNode(const PTStartTransaction *tnode) {
-  exec_context_->StartTransaction(tnode->isolation_level(), ql_env_);
-  return Status::OK();
+  return exec_context_->StartTransaction(tnode->isolation_level(), ql_env_);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1124,6 +1231,105 @@ Status Executor::ExecPTNode(const PTUseKeyspace *tnode) {
 
 //--------------------------------------------------------------------------------------------------
 
+Status Executor::ExecPTNode(const PTAlterKeyspace *tnode) {
+  // To get new keyspace properties use: tnode->keyspace_properties()
+  // Current implementation only check existence of this keyspace.
+  const Status s = ql_env_->AlterKeyspace(tnode->name());
+
+  if (PREDICT_FALSE(!s.ok())) {
+    ErrorCode error_code = s.IsNotFound() ? ErrorCode::KEYSPACE_NOT_FOUND : ErrorCode::SERVER_ERROR;
+    return exec_context_->Error(tnode, s, error_code);
+  }
+
+  result_ = std::make_shared<SchemaChangeResult>("UPDATED", "KEYSPACE", tnode->name());
+  return Status::OK();
+}
+
+//--------------------------------------------------------------------------------------------------
+
+namespace {
+
+void AddStringRow(const string& str, QLRowBlock* row_block) {
+  row_block->Extend().mutable_column(0)->set_string_value(str);
+}
+
+void RightPad(const int length, string *s) {
+  s->append(length - s->length(), ' ');
+}
+} // namespace
+
+Status Executor::ExecPTNode(const PTExplainStmt *tnode) {
+  TreeNode::SharedPtr subStmt = tnode->stmt();
+  PTDmlStmt *dmlStmt = down_cast<PTDmlStmt *>(subStmt.get());
+  const YBTableName explainTable("Explain");
+  ColumnSchema explainColumn("QUERY PLAN", STRING);
+  auto explainColumns = std::make_shared<std::vector<ColumnSchema>>(
+      std::initializer_list<ColumnSchema>{explainColumn});
+  auto explainSchema = std::make_shared<Schema>(*explainColumns, 0);
+  QLRowBlock row_block(*explainSchema);
+  faststring buffer;
+  ExplainPlanPB explain_plan = dmlStmt->AnalysisResultToPB();
+  switch (explain_plan.plan_case()) {
+    case ExplainPlanPB::kSelectPlan: {
+      SelectPlanPB *select_plan = explain_plan.mutable_select_plan();
+      if (select_plan->has_aggregate()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_aggregate());
+        AddStringRow(select_plan->aggregate(), &row_block);
+      }
+      RightPad(select_plan->output_width(), select_plan->mutable_select_type());
+      AddStringRow(select_plan->select_type(), &row_block);
+      if (select_plan->has_key_conditions()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_key_conditions());
+        AddStringRow(select_plan->key_conditions(), &row_block);
+      }
+      if (select_plan->has_filter()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_filter());
+        AddStringRow(select_plan->filter(), &row_block);
+      }
+      break;
+    }
+    case ExplainPlanPB::kInsertPlan: {
+      InsertPlanPB *insert_plan = explain_plan.mutable_insert_plan();
+      RightPad(insert_plan->output_width(), insert_plan->mutable_insert_type());
+      AddStringRow(insert_plan->insert_type(), &row_block);
+      break;
+    }
+    case ExplainPlanPB::kUpdatePlan: {
+      UpdatePlanPB *update_plan = explain_plan.mutable_update_plan();
+      RightPad(update_plan->output_width(), update_plan->mutable_update_type());
+      AddStringRow(update_plan->update_type(), &row_block);
+      RightPad(update_plan->output_width(), update_plan->mutable_scan_type());
+      AddStringRow(update_plan->scan_type(), &row_block);
+      RightPad(update_plan->output_width(), update_plan->mutable_key_conditions());
+      AddStringRow(update_plan->key_conditions(), &row_block);
+      break;
+    }
+    case ExplainPlanPB::kDeletePlan: {
+      DeletePlanPB *delete_plan = explain_plan.mutable_delete_plan();
+      RightPad(delete_plan->output_width(), delete_plan->mutable_delete_type());
+      AddStringRow(delete_plan->delete_type(), &row_block);
+      RightPad(delete_plan->output_width(), delete_plan->mutable_scan_type());
+      AddStringRow(delete_plan->scan_type(), &row_block);
+      RightPad(delete_plan->output_width(), delete_plan->mutable_key_conditions());
+      AddStringRow(delete_plan->key_conditions(), &row_block);
+      if (delete_plan->has_filter()) {
+        RightPad(delete_plan->output_width(), delete_plan->mutable_filter());
+        AddStringRow(delete_plan->filter(), &row_block);
+      }
+      break;
+    }
+    case ExplainPlanPB::PLAN_NOT_SET: {
+      return exec_context_->Error(tnode, ErrorCode::EXEC_ERROR);
+      break;
+    }
+  }
+  row_block.Serialize(YQL_CLIENT_CQL, &buffer);
+  result_ = std::make_shared<RowsResult>(explainTable, explainColumns, buffer.ToString());
+  return Status::OK();
+}
+
+//--------------------------------------------------------------------------------------------------
+
 namespace {
 
 // When executing a DML in a transaction or a SELECT statement on a transaction-enabled table, the
@@ -1131,9 +1337,25 @@ namespace {
 // - TryAgain: when the transaction has a write conflict with another transaction or read-
 //             restart is required.
 // - Expired:  when the transaction expires due to missed heartbeat
-// - TimedOut: when a tablet times out while contacting the transaction status tablet
 bool NeedsRestart(const Status& s) {
-  return s.IsTryAgain() || s.IsExpired() || s.IsTimedOut();
+  return s.IsTryAgain() || s.IsExpired();
+}
+
+// Process TnodeContexts and their children under an ExecContext.
+Status ProcessTnodeContexts(ExecContext* exec_context,
+                            const std::function<Result<bool>(TnodeContext*)>& processor) {
+  for (TnodeContext& tnode_context : exec_context->tnode_contexts()) {
+    TnodeContext* p = &tnode_context;
+    while (p != nullptr) {
+      const Result<bool> done = processor(p);
+      RETURN_NOT_OK(done);
+      if (done.get()) {
+        return Status::OK();
+      }
+      p = p->child_context();
+    }
+  }
+  return Status::OK();
 }
 
 } // namespace
@@ -1142,7 +1364,7 @@ void Executor::FlushAsync() {
   // Buffered read/write operations are flushed in rounds. In each round, FlushAsync() is called to
   // flush buffered operations in the non-transactional session in the Executor or the transactional
   // session in each ExecContext if any. Also, transactions in any ExecContext ready to commit with
-  // no more pending operation are also be committed. If there is no session to flush nor
+  // no more pending operation are also committed. If there is no session to flush nor
   // transaction to commit, the statement is executed.
   //
   // As flushes and commits happen, multiple FlushAsyncDone() and CommitDone() callbacks can be
@@ -1179,9 +1401,13 @@ void Executor::FlushAsync() {
         CommitDone(s, exec_context);
       });
   }
+  // Use the same score on each tablet. So probability of rejecting write should be related
+  // to used capacity.
+  auto memory_limit_score = RandomUniformReal<double>(0.01, 1);
   for (const auto& pair : flush_sessions) {
     auto session = pair.first;
     auto exec_context = pair.second;
+    session->SetMemoryLimitScore(memory_limit_score);
     TRACE("Flush Async");
     session->FlushAsync([this, exec_context](const Status& s) {
         FlushAsyncDone(s, exec_context);
@@ -1194,14 +1420,18 @@ void Executor::FlushAsync() {
     if (IsReturnsStatusBatch()) {
       for (ExecContext& exec_context : exec_contexts_) {
         int64_t row_count = 0;
-        for (TnodeContext& tnode_context : exec_context.tnode_contexts()) {
-          for (client::YBqlOpPtr& op : tnode_context.ops()) {
-            if (!op->rows_data().empty()) {
-              DCHECK_EQ(++row_count, 1) << exec_context.stmt() << " returns multiple status row";
-              RETURN_STMT_NOT_OK(AppendResult(std::make_shared<RowsResult>(op.get())));
-            }
-          }
-        }
+        RETURN_STMT_NOT_OK(ProcessTnodeContexts(
+            &exec_context,
+            [this, &exec_context, &row_count](TnodeContext* tnode_context) -> Result<bool> {
+              for (client::YBqlOpPtr& op : tnode_context->ops()) {
+                if (!op->rows_data().empty()) {
+                  DCHECK_EQ(++row_count, 1) << exec_context.stmt()
+                                            << " returned multiple status rows";
+                  RETURN_NOT_OK(AppendRowsResult(std::make_shared<RowsResult>(op.get())));
+                }
+              }
+              return false; // not done
+            }));
       }
     }
     return StatementExecuted(Status::OK());
@@ -1216,7 +1446,6 @@ void Executor::FlushAsyncDone(Status s, ExecContext* exec_context) {
   TRACE("Flush Async Done");
   // Process FlushAsync status for either transactional session in an ExecContext, or the
   // non-transactional session in the Executor for other ExecContexts with no transactional session.
-  const int64_t num_async_calls = --num_async_calls_;
   const YBSessionPtr& session = exec_context != nullptr ? GetSession(exec_context) : session_;
 
   // When any error occurs during the dispatching of YBOperation, YBSession saves the error and
@@ -1254,14 +1483,14 @@ void Executor::FlushAsyncDone(Status s, ExecContext* exec_context) {
 
   // Process async results exclusively if this is the last callback of the last FlushAsync() and
   // there is no more outstanding async call.
-  if (num_async_calls == 0) {
+  if (--num_async_calls_ == 0) {
     ProcessAsyncResults();
   }
 }
 
 void Executor::CommitDone(Status s, ExecContext* exec_context) {
   TRACE("Commit Transaction Done");
-  const int64_t num_async_calls = --num_async_calls_;
+
   if (s.ok()) {
     if (ql_metrics_ != nullptr) {
       const MonoTime now = MonoTime::Now();
@@ -1270,7 +1499,7 @@ void Executor::CommitDone(Status s, ExecContext* exec_context) {
     }
   } else {
     if (NeedsRestart(s)) {
-      exec_context->Reset(client::Restart::kTrue);
+      exec_context->Reset(client::Restart::kTrue, rescheduler_);
     } else {
       std::lock_guard<std::mutex> lock(status_mutex_);
       async_status_ = s;
@@ -1279,7 +1508,7 @@ void Executor::CommitDone(Status s, ExecContext* exec_context) {
 
   // Process async results exclusively if this is the last callback of the last FlushAsync() and
   // there is no more outstanding async call.
-  if (num_async_calls == 0) {
+  if (--num_async_calls_ == 0) {
     ProcessAsyncResults();
   }
 }
@@ -1287,8 +1516,8 @@ void Executor::CommitDone(Status s, ExecContext* exec_context) {
 void Executor::ProcessAsyncResults(const bool rescheduled) {
   // If the current thread is not the RPC worker thread, call the callback directly. Otherwise,
   // reschedule the call to resume in the RPC worker thread.
-  if (!rescheduled && !rpc::ThreadPool::IsCurrentThreadRpcWorker()) {
-    return rescheduler_([this]() { ProcessAsyncResults(true /* rescheduled */); });
+  if (!rescheduled && rescheduler_->NeedReschedule()) {
+    return rescheduler_->Reschedule(&process_async_results_task_.Bind(this));
   }
 
   // Return error immediately when async call failed.
@@ -1296,6 +1525,7 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
 
   // Go through each ExecContext and process async results.
   bool has_buffered_ops = false;
+  bool has_restart = false;
   const MonoTime now = (ql_metrics_ != nullptr) ? MonoTime::Now() : MonoTime();
   for (auto exec_itr = exec_contexts_.begin(); exec_itr != exec_contexts_.end(); ) {
 
@@ -1304,11 +1534,20 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
 
     // Restart a statement if necessary
     if (exec_context_->restart()) {
+      has_restart = true;
       const TreeNode *root = exec_context_->parse_tree().root().get();
       // Clear partial rows accumulated from the SELECT statement.
       if (root->opcode() == TreeNodeOpcode::kPTSelectStmt) {
         result_ = nullptr;
       }
+
+      // We should restart read, but read time was specified by caller.
+      // For instance it could happen in case of pagination.
+      if (exec_context_->params().read_time()) {
+        RETURN_STMT_NOT_OK(
+            STATUS(IllegalState, "Restart read required, but read time specified by caller"));
+      }
+
       YBSessionPtr session = GetSession(exec_context_);
       session->SetReadPoint(client::Restart::kTrue);
       RETURN_STMT_NOT_OK(ExecTreeNode(root));
@@ -1344,7 +1583,8 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
       // For SELECT statement, aggregate result sets if needed.
       const TreeNode *tnode = tnode_context.tnode();
       if (tnode->opcode() == TreeNodeOpcode::kPTSelectStmt) {
-        RETURN_STMT_NOT_OK(AggregateResultSets(static_cast<const PTSelectStmt *>(tnode)));
+        RETURN_STMT_NOT_OK(AggregateResultSets(static_cast<const PTSelectStmt *>(tnode),
+                                               &tnode_context));
       }
 
       // Update the metrics for SELECT/INSERT/UPDATE/DELETE here after the ops have been completed
@@ -1383,7 +1623,8 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
         continue;
       }
 
-      // Remove the statement tnode that has completed.
+      // Move rows results and remove the statement tnode that has completed.
+      RETURN_STMT_NOT_OK(AppendRowsResult(std::move(tnode_context.rows_result())));
       tnode_itr = tnode_contexts.erase(tnode_itr);
     }
 
@@ -1399,8 +1640,13 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
   // recurse too deeply hitting the stack limitiation. Rescheduling can also avoid occupying the
   // RPC worker thread for too long starving other CQL calls waiting in the queue. If there is no
   // buffered ops to flush, just call FlushAsync() to commit the transactions if any.
-  if (has_buffered_ops && !rescheduled) {
-    rescheduler_([this]() { FlushAsync(); });
+  //
+  // When restart is required we will reexecute the whole operation with new transaction.
+  // Since restart could happen multiple times, it is possible that we will do it recursively,
+  // when local call is enabled.
+  // So to avoid stack overflow we use reschedule in this case.
+  if ((has_buffered_ops || has_restart) && !rescheduled) {
+    rescheduler_->Reschedule(&flush_async_task_.Bind(this));
   } else {
     FlushAsync();
   }
@@ -1441,14 +1687,17 @@ Result<bool> Executor::ProcessTnodeResults(TnodeContext* tnode_context) {
          (op->response().has_applied() && !op->response().applied()))) {
       exec_context_->AbortTransaction();
       if (IsReturnsStatusBatch()) {
-        for (auto& tnode_context2 : exec_context_->tnode_contexts()) {
-          for (auto& op2 : tnode_context2.ops()) {
-            if (op2 != op) {
-              op2->mutable_response()->set_status(QLResponsePB::YQL_STATUS_OK);
-              op2->rows_data().clear();
-            }
-          }
-        }
+        RETURN_NOT_OK(ProcessTnodeContexts(
+            exec_context_,
+            [&op](TnodeContext* tnode_context) -> Result<bool> {
+              for (auto& other : tnode_context->ops()) {
+                if (other != op) {
+                  other->mutable_response()->set_status(QLResponsePB::YQL_STATUS_OK);
+                  other->mutable_rows_data()->clear();
+                }
+              }
+              return false; // not done
+            }));
       }
     }
 
@@ -1458,9 +1707,10 @@ Result<bool> Executor::ProcessTnodeResults(TnodeContext* tnode_context) {
       if (response.has_child_transaction_result()) {
         const auto& result = response.child_transaction_result();
         const Status s = exec_context_->ApplyChildTransactionResult(result);
+        // If restart is needed, reset the current context and return immediately.
         if (NeedsRestart(s)) {
-          exec_context_->Reset(client::Restart::kTrue);
-          break;
+          exec_context_->Reset(client::Restart::kTrue, rescheduler_);
+          return false;
         }
         RETURN_NOT_OK(s);
       }
@@ -1473,28 +1723,75 @@ Result<bool> Executor::ProcessTnodeResults(TnodeContext* tnode_context) {
       continue;
     }
 
-    // Append the row if present.
+    // Append the rows if present.
     if (!op->rows_data().empty()) {
-      RETURN_NOT_OK(AppendResult(std::make_shared<RowsResult>(op.get())));
+      RETURN_NOT_OK(tnode_context->AppendRowsResult(std::make_shared<RowsResult>(op.get())));
     }
 
     // For SELECT statement, check if there are more rows to fetch and apply the op as needed.
     if (tnode->opcode() == TreeNodeOpcode::kPTSelectStmt) {
       const auto* select_stmt = static_cast<const PTSelectStmt *>(tnode);
-      DCHECK_EQ(op->type(), YBOperation::Type::QL_READ);
-      const auto& read_op = std::static_pointer_cast<YBqlReadOp>(op);
-      if (VERIFY_RESULT(FetchMoreRows(select_stmt, read_op, tnode_context, exec_context_))) {
-        op->mutable_response()->Clear();
-        TRACE("Apply");
-        RETURN_NOT_OK(session_->Apply(op));
-        has_buffered_ops = true;
-        op_itr++;
-        continue;
+      // Do this except for the parent SELECT with an index. For covered index, we will select
+      // from the index only. For uncovered index, the parent SELECT will fetch using the primary
+      // keys returned from below.
+      if (!select_stmt->child_select()) {
+        DCHECK_EQ(op->type(), YBOperation::Type::QL_READ);
+        const auto& read_op = std::static_pointer_cast<YBqlReadOp>(op);
+        if (VERIFY_RESULT(FetchMoreRows(select_stmt, read_op, tnode_context, exec_context_))) {
+          op->mutable_response()->Clear();
+          TRACE("Apply");
+          RETURN_NOT_OK(session_->Apply(op));
+          has_buffered_ops = true;
+          op_itr++;
+          continue;
+        }
       }
     }
 
     // Remove the op that has completed.
     op_itr = ops.erase(op_itr);
+  }
+
+  // If there is a child context, process it.
+  TnodeContext* child_context = tnode_context->child_context();
+  if (child_context != nullptr) {
+    const TreeNode *child_tnode = child_context->tnode();
+    if (VERIFY_RESULT(ProcessTnodeResults(child_context))) {
+      has_buffered_ops = true;
+    }
+
+    // If the child selects from an uncovered index, extract the primary keys returned and use them
+    // to select from the indexed table.
+    DCHECK_EQ(child_tnode->opcode(), TreeNodeOpcode::kPTSelectStmt);
+    DCHECK(!static_cast<const PTSelectStmt *>(child_tnode)->index_id().empty());
+    const bool covers_fully = static_cast<const PTSelectStmt *>(child_tnode)->covers_fully();
+    DCHECK_EQ(tnode->opcode(), TreeNodeOpcode::kPTSelectStmt);
+    const auto* select_stmt = static_cast<const PTSelectStmt *>(tnode);
+    string& rows_data = child_context->rows_result()->rows_data();
+    if (!covers_fully && !rows_data.empty()) {
+      QLRowBlock* keys = tnode_context->keys();
+      keys->rows().clear();
+      Slice data(rows_data);
+      RETURN_NOT_OK(keys->Deserialize(YQL_CLIENT_CQL,  &data));
+      const YBqlReadOpPtr& select_op = tnode_context->uncovered_select_op();
+      if (VERIFY_RESULT(FetchRowsByKeys(select_stmt, select_op, *keys, tnode_context))) {
+        has_buffered_ops = true;
+      }
+      rows_data.clear();
+    }
+
+    // If the current statement tnode and its child are done, move the result from the child
+    // for covered query, or just the paging state for uncovered query.
+    if (!tnode_context->HasPendingOperations() && !child_context->HasPendingOperations()) {
+      if (covers_fully) {
+        RETURN_NOT_OK(tnode_context->AppendRowsResult(std::move(child_context->rows_result())));
+      } else {
+        if (!tnode_context->rows_result()) {
+          RETURN_NOT_OK(tnode_context->AppendRowsResult(std::make_shared<RowsResult>(select_stmt)));
+        }
+        tnode_context->rows_result()->SetPagingState(std::move(*child_context->rows_result()));
+      }
+    }
   }
 
   return has_buffered_ops;
@@ -1695,7 +1992,15 @@ bool Executor::WriteBatch::Empty() const {
 
 Status Executor::AddOperation(const YBqlReadOpPtr& op, TnodeContext *tnode_context) {
   DCHECK(write_batch_.Empty()) << "Concurrent read and write operations not supported yet";
+
+  op->mutable_request()->set_request_id(exec_context_->params().request_id());
   tnode_context->AddOperation(op);
+
+  // We need consistent read point if statement is executed in multiple RPC commands.
+  if (tnode_context->UnreadPartitionsRemaining() > 0 ||
+      op->request().hashed_column_values().empty()) {
+    session_->SetForceConsistentRead(client::ForceConsistentRead::kTrue);
+  }
 
   TRACE("Apply");
   return session_->Apply(op);
@@ -1740,7 +2045,7 @@ Status Executor::ProcessStatementStatus(const ParseTree& parse_tree, const Statu
         errcode == ErrorCode::WRONG_METADATA_VERSION   ||
         errcode == ErrorCode::INVALID_TABLE_DEFINITION ||
         errcode == ErrorCode::INVALID_ARGUMENTS        ||
-        errcode == ErrorCode::TABLE_NOT_FOUND          ||
+        errcode == ErrorCode::OBJECT_NOT_FOUND         ||
         errcode == ErrorCode::TYPE_NOT_FOUND) {
       parse_tree.ClearAnalyzedTableCache(ql_env_);
       parse_tree.ClearAnalyzedUDTypeCache(ql_env_);
@@ -1795,41 +2100,46 @@ Status Executor::ProcessOpStatus(const PTDmlStmt* stmt,
 }
 
 Status Executor::ProcessAsyncStatus(const OpErrors& op_errors, ExecContext* exec_context) {
-  for (auto& tnode_context : exec_context->tnode_contexts()) {
-    const TreeNode* tnode = tnode_context.tnode();
-    for (auto& op : tnode_context.ops()) {
-      Status s;
-      const auto itr = op_errors.find(op.get());
-      if (itr != op_errors.end()) {
-        s = itr->second;
-      }
-      if (PREDICT_FALSE(!s.ok() && !NeedsRestart(s))) {
-        // YBOperation returns not-found error when the tablet is not found.
-        const auto errcode = s.IsNotFound() ? ErrorCode::TABLET_NOT_FOUND : ErrorCode::EXEC_ERROR;
-        s = exec_context->Error(tnode, s, errcode);
-      }
-      if (s.ok()) {
-        DCHECK(tnode->IsDml()) << "Only DML should issue a read/write operation";
-        s = ProcessOpStatus(static_cast<const PTDmlStmt *>(tnode), op, exec_context);
-      }
-      if (NeedsRestart(s)) {
-        exec_context->Reset(client::Restart::kTrue);
-        return Status::OK();
-      }
-      RETURN_NOT_OK(ProcessStatementStatus(exec_context->parse_tree(), s));
-    }
-  }
-  return Status::OK();
+  return ProcessTnodeContexts(
+      exec_context,
+      [this, exec_context, &op_errors](TnodeContext* tnode_context) -> Result<bool> {
+        const TreeNode* tnode = tnode_context->tnode();
+        for (auto& op : tnode_context->ops()) {
+          Status s;
+          const auto itr = op_errors.find(op.get());
+          if (itr != op_errors.end()) {
+            s = itr->second;
+          }
+          if (PREDICT_FALSE(!s.ok() && !NeedsRestart(s))) {
+            // YBOperation returns not-found error when the tablet is not found.
+            const auto errcode = s.IsNotFound() ? ErrorCode::TABLET_NOT_FOUND
+                                                : ErrorCode::EXEC_ERROR;
+            s = exec_context->Error(tnode, s, errcode);
+          }
+          if (s.ok()) {
+            DCHECK(tnode->IsDml()) << "Only DML should issue a read/write operation";
+            s = ProcessOpStatus(static_cast<const PTDmlStmt *>(tnode), op, exec_context);
+          }
+          if (NeedsRestart(s)) {
+            exec_context->Reset(client::Restart::kTrue, rescheduler_);
+            return true; // done
+          }
+          RETURN_NOT_OK(ProcessStatementStatus(exec_context->parse_tree(), s));
+        }
+        return false; // not done
+      });
 }
 
-Status Executor::AppendResult(const RowsResult::SharedPtr& result) {
-  CHECK(result) << "No result to append";
-  if (result_ == nullptr) {
-    result_ = result;
+Status Executor::AppendRowsResult(RowsResult::SharedPtr&& rows_result) {
+  if (!rows_result) {
+    return Status::OK();
+  }
+  if (!result_) {
+    result_ = std::move(rows_result);
     return Status::OK();
   }
   CHECK(result_->type() == ExecutedResult::Type::ROWS);
-  return std::static_pointer_cast<RowsResult>(result_)->Append(*result);
+  return std::static_pointer_cast<RowsResult>(result_)->Append(std::move(*rows_result));
 }
 
 void Executor::StatementExecuted(const Status& s) {
@@ -1883,6 +2193,18 @@ void Executor::Reset() {
   result_ = nullptr;
   cb_.Reset();
   returns_status_batch_opt_ = boost::none;
+}
+
+QLExpressionPB* CreateQLExpression(QLWriteRequestPB *req, const ColumnDesc& col_desc) {
+  if (col_desc.is_hash()) {
+    return req->add_hashed_column_values();
+  } else if (col_desc.is_primary()) {
+    return req->add_range_column_values();
+  } else {
+    QLColumnValuePB *col_pb = req->add_column_values();
+    col_pb->set_column_id(col_desc.id());
+    return col_pb->mutable_expr();
+  }
 }
 
 }  // namespace ql

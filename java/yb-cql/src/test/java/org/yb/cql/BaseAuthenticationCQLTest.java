@@ -15,21 +15,59 @@ package org.yb.cql;
 
 import com.datastax.driver.core.*;
 import org.junit.BeforeClass;
+import org.yb.minicluster.BaseMiniClusterTest;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static junit.framework.TestCase.fail;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
 
 public class BaseAuthenticationCQLTest extends BaseCQLTest {
+  // Type of resources.
+  public static final String ALL_KEYSPACES = "ALL KEYSPACES";
+  public static final String KEYSPACE = "KEYSPACE";
+  public static final String TABLE = "TABLE";
+  public static final String ALL_ROLES = "ALL ROLES";
+  public static final String ROLE = "ROLE";
+
+  // Permissions.
+  public static final String ALL = "ALL";
+  public static final String ALTER = "ALTER";
+  public static final String AUTHORIZE = "AUTHORIZE";
+  public static final String CREATE = "CREATE";
+  public static final String DESCRIBE = "DESCRIBE";
+  public static final String DROP = "DROP";
+  public static final String MODIFY = "MODIFY";
+  public static final String SELECT = "SELECT";
+
+  // Permissions in the same order as in catalog_manager.cc.
+  public static final List<String> ALL_PERMISSIONS =
+      Arrays.asList(ALTER, AUTHORIZE, CREATE, DESCRIBE, DROP, MODIFY, SELECT);
+
+  public static final List<String> ALL_PERMISSIONS_FOR_KEYSPACE =
+      Arrays.asList(ALTER, AUTHORIZE, CREATE, DROP, MODIFY, SELECT);
+
+  public static final List<String> ALL_PERMISSIONS_FOR_TABLE =
+      Arrays.asList(ALTER, AUTHORIZE, DROP, MODIFY, SELECT);
+
+  public static final List<String> ALL_PERMISSIONS_FOR_ROLE =
+      Arrays.asList(ALTER, AUTHORIZE, DROP);
+
+  public static final List<String> ALL_PERMISSIONS_FOR_ALL_ROLES =
+      Arrays.asList(ALTER, AUTHORIZE, CREATE, DESCRIBE, DROP);
+
+  public static final List<String> ALL_PERMISSIONS_FOR_ALL_KEYSPACES =
+      Arrays.asList(ALTER, AUTHORIZE, CREATE, DROP, MODIFY, SELECT);
+
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     // Setting verbose level for debugging.
-    BaseCQLTest.tserverArgs = Arrays.asList("--use_cassandra_authentication=true");
+    BaseMiniClusterTest.tserverArgs.add("--use_cassandra_authentication=true");
     BaseCQLTest.setUpBeforeClass();
   }
 
@@ -40,6 +78,13 @@ public class BaseAuthenticationCQLTest extends BaseCQLTest {
 
   public Session getDefaultSession() {
     Cluster.Builder cb = getDefaultClusterBuilder();
+    Cluster c = cb.build();
+    Session s = c.connect();
+    return s;
+  }
+
+  public Session getSession(String username, String password) {
+    Cluster.Builder cb = super.getDefaultClusterBuilder().withCredentials(username, password);
     Cluster c = cb.build();
     Session s = c.connect();
     return s;
@@ -67,13 +112,14 @@ public class BaseAuthenticationCQLTest extends BaseCQLTest {
     c = cb.build();
     try {
       Session s = c.connect();
-      s.execute("SELECT * FROM system_auth.roles;");
+      s.execute("SELECT * FROM system_schema.tables;");
       // If we're expecting a failure, we should NOT be in here.
       assertFalse(expectFailure);
     } catch (com.datastax.driver.core.exceptions.AuthenticationException e) {
       // If we're expecting a failure, we should be in here.
       assertTrue(expectFailure);
     }
+    c.close();
   }
 
   // Verifies that roleName exists in the system_auth.roles table, and that canLogin and isSuperuser
@@ -83,9 +129,19 @@ public class BaseAuthenticationCQLTest extends BaseCQLTest {
     verifyRoleFields(roleName, canLogin, isSuperuser, new ArrayList<>());
   }
 
+  public void verifyRoleWithSession(String roleName, boolean canLogin, boolean isSuperuser,
+                                    Session s) throws Exception {
+    verifyRoleFieldsWithSession(roleName, canLogin, isSuperuser, new ArrayList<>(), s);
+  }
+
   private void verifyRoleFields(String roleName, boolean canLogin, boolean isSuperuser,
                                 List<String> memberOf) throws Exception {
     Session s = getDefaultSession();
+    verifyRoleFieldsWithSession(roleName, canLogin, isSuperuser, memberOf, s);
+  }
+
+  private void verifyRoleFieldsWithSession(String roleName, boolean canLogin, boolean isSuperuser,
+                                          List<String> memberOf, Session s) throws Exception {
     ResultSet rs = s.execute(
         String.format("SELECT * FROM system_auth.roles WHERE role = '%s';", roleName));
 
@@ -100,6 +156,13 @@ public class BaseAuthenticationCQLTest extends BaseCQLTest {
   protected void testCreateRoleHelper(String roleName, String password, boolean canLogin,
                                       boolean isSuperuser) throws Exception {
     Session s = getDefaultSession();
+    testCreateRoleHelperWithSession(roleName, password, canLogin, isSuperuser, true, s);
+  }
+
+  protected void testCreateRoleHelperWithSession(String roleName, String password,
+                                                 boolean canLogin, boolean isSuperuser,
+                                                 boolean verifyConnectivity, Session s)
+      throws Exception {
 
     // Create the role.
     String createStmt = String.format(
@@ -109,9 +172,39 @@ public class BaseAuthenticationCQLTest extends BaseCQLTest {
     s.execute(createStmt);
 
     // Verify that we can connect using the new role.
-    checkConnectivity(true, roleName, password, !canLogin);
+    if (verifyConnectivity) {
+      checkConnectivity(true, roleName, password, !canLogin);
+    }
 
     // Verify that the information got written into system_auth.roles correctly.
-    verifyRole(roleName, canLogin, isSuperuser);
+    verifyRoleWithSession(roleName, canLogin, isSuperuser, s);
+  }
+
+  public void assertPermissionsGranted(Session s, String role, String resource,
+                                       List<String> permissions) {
+    String stmt = String.format("SELECT permissions FROM system_auth.role_permissions " +
+        "WHERE role = '%s' and resource = '%s';", role, resource);
+    List<Row> rows = s.execute(stmt).all();
+
+    if (permissions.isEmpty()) {
+      assertEquals(0, rows.size());
+      return;
+    }
+
+    assertEquals(1, rows.size());
+
+    List list = rows.get(0).getList("permissions", String.class);
+    assertEquals(permissions.size(), list.size());
+
+    for (String permission : permissions) {
+      if (!list.contains(permission)) {
+        fail("Unable to find permission " + permission);
+      }
+    }
+  }
+
+  public void grantPermission(String permission, String resourceType, String resource,
+                               String role, Session s) throws Exception {
+    s.execute(String.format("GRANT %s ON %s %s TO %s", permission, resourceType, resource, role));
   }
 }

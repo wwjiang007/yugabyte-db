@@ -48,12 +48,12 @@
 namespace yb {
 namespace master {
 
-Result<std::unique_ptr<TSDescriptor>> TSDescriptor::RegisterNew(
+Result<TSDescriptorPtr> TSDescriptor::RegisterNew(
     const NodeInstancePB& instance,
     const TSRegistrationPB& registration,
     CloudInfoPB local_cloud_info,
     rpc::ProxyCache* proxy_cache) {
-  std::unique_ptr<TSDescriptor> result = std::make_unique<YB_EDITION_NS_PREFIX TSDescriptor>(
+  auto result = std::make_shared<YB_EDITION_NS_PREFIX TSDescriptor>(
       instance.permanent_uuid());
   RETURN_NOT_OK(result->Register(instance, registration, std::move(local_cloud_info), proxy_cache));
   return std::move(result);
@@ -76,7 +76,7 @@ Status TSDescriptor::Register(const NodeInstancePB& instance,
                               const TSRegistrationPB& registration,
                               CloudInfoPB local_cloud_info,
                               rpc::ProxyCache* proxy_cache) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   return RegisterUnlocked(instance, registration, std::move(local_cloud_info), proxy_cache);
 }
 
@@ -120,7 +120,7 @@ Status TSDescriptor::RegisterUnlocked(
 }
 
 std::string TSDescriptor::placement_uuid() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return placement_uuid_;
 }
 
@@ -130,33 +130,33 @@ std::string TSDescriptor::generate_placement_id(const CloudInfoPB& ci) {
 }
 
 std::string TSDescriptor::placement_id() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return placement_id_;
 }
 
 void TSDescriptor::UpdateHeartbeatTime() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   last_heartbeat_ = MonoTime::Now();
 }
 
 MonoDelta TSDescriptor::TimeSinceHeartbeat() const {
   MonoTime now(MonoTime::Now());
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return now.GetDeltaSince(last_heartbeat_);
 }
 
 int64_t TSDescriptor::latest_seqno() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return latest_seqno_;
 }
 
 bool TSDescriptor::has_tablet_report() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return has_tablet_report_;
 }
 
 void TSDescriptor::set_has_tablet_report(bool has_report) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   has_tablet_report_ = has_report;
 }
 
@@ -178,30 +178,34 @@ void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
 }
 
 void TSDescriptor::IncrementRecentReplicaCreations() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   DecayRecentReplicaCreationsUnlocked();
   recent_replica_creations_ += 1;
 }
 
 double TSDescriptor::RecentReplicaCreations() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   DecayRecentReplicaCreationsUnlocked();
   return recent_replica_creations_;
 }
 
-void TSDescriptor::GetRegistration(TSRegistrationPB* reg) const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  CHECK(registration_) << "No registration";
-  CHECK_NOTNULL(reg)->CopyFrom(*registration_);
+TSRegistrationPB TSDescriptor::GetRegistration() const {
+  std::shared_lock<rw_spinlock> l(lock_);
+  return *registration_;
 }
 
-void TSDescriptor::GetTSInformationPB(TSInformationPB* ts_info) const {
-  GetRegistration(ts_info->mutable_registration());
-  GetNodeInstancePB(ts_info->mutable_tserver_instance());
+TSInformationPB TSDescriptor::GetTSInformationPB() const {
+  std::shared_lock<rw_spinlock> l(lock_);
+  CHECK(registration_) << "No registration";
+  TSInformationPB result;
+  *result.mutable_registration() = *registration_;
+  result.mutable_tserver_instance()->set_permanent_uuid(permanent_uuid_);
+  result.mutable_tserver_instance()->set_instance_seqno(latest_seqno_);
+  return result;
 }
 
 bool TSDescriptor::MatchesCloudInfo(const CloudInfoPB& cloud_info) const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   const auto& ci = registration_->common().cloud_info();
 
   return cloud_info.placement_cloud() == ci.placement_cloud() &&
@@ -210,8 +214,7 @@ bool TSDescriptor::MatchesCloudInfo(const CloudInfoPB& cloud_info) const {
 }
 
 bool TSDescriptor::IsRunningOn(const HostPortPB& hp) const {
-  TSRegistrationPB reg;
-  GetRegistration(&reg);
+  TSRegistrationPB reg = GetRegistration();
   auto predicate = [&hp](const HostPortPB& rhs) {
     return rhs.host() == hp.host() && rhs.port() == hp.port();
   };
@@ -228,16 +231,11 @@ bool TSDescriptor::IsRunningOn(const HostPortPB& hp) const {
   return false;
 }
 
-void TSDescriptor::GetNodeInstancePB(NodeInstancePB* instance_pb) const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  instance_pb->set_permanent_uuid(permanent_uuid_);
-  instance_pb->set_instance_seqno(latest_seqno_);
-}
-
 Result<HostPort> TSDescriptor::GetHostPortUnlocked() const {
   const auto& addr = DesiredHostPort(registration_->common(), local_cloud_info_);
   if (addr.host().empty()) {
-    return STATUS(NetworkError, "Unable to find the TS address: ", registration_->DebugString());
+    return STATUS_FORMAT(NetworkError, "Unable to find the TS address for $0: $1",
+                         permanent_uuid_, registration_->ShortDebugString());
   }
 
   return HostPortFromPB(addr);
@@ -248,37 +246,47 @@ bool TSDescriptor::IsAcceptingLeaderLoad(const ReplicationInfoPB& replication_in
 }
 
 void TSDescriptor::UpdateMetrics(const TServerMetricsPB& metrics) {
-  std::lock_guard<simple_spinlock> l(lock_);
-  tsMetrics_.total_memory_usage = metrics.total_ram_usage();
-  tsMetrics_.total_sst_file_size = metrics.total_sst_file_size();
-  tsMetrics_.uncompressed_sst_file_size = metrics.uncompressed_sst_file_size();
-  tsMetrics_.read_ops_per_sec = metrics.read_ops_per_sec();
-  tsMetrics_.write_ops_per_sec = metrics.write_ops_per_sec();
-  tsMetrics_.uptime_seconds = metrics.uptime_seconds();
+  std::lock_guard<rw_spinlock> l(lock_);
+  ts_metrics_.total_memory_usage = metrics.total_ram_usage();
+  ts_metrics_.total_sst_file_size = metrics.total_sst_file_size();
+  ts_metrics_.uncompressed_sst_file_size = metrics.uncompressed_sst_file_size();
+  ts_metrics_.read_ops_per_sec = metrics.read_ops_per_sec();
+  ts_metrics_.write_ops_per_sec = metrics.write_ops_per_sec();
+  ts_metrics_.uptime_seconds = metrics.uptime_seconds();
 }
 
 bool TSDescriptor::HasTabletDeletePending() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return !tablets_pending_delete_.empty();
 }
 
 bool TSDescriptor::IsTabletDeletePending(const std::string& tablet_id) const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return tablets_pending_delete_.count(tablet_id);
 }
 
+std::string TSDescriptor::PendingTabletDeleteToString() const {
+  std::shared_lock<rw_spinlock> l(lock_);
+  return yb::ToString(tablets_pending_delete_);
+}
+
 void TSDescriptor::AddPendingTabletDelete(const std::string& tablet_id) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   tablets_pending_delete_.insert(tablet_id);
 }
 
 void TSDescriptor::ClearPendingTabletDelete(const std::string& tablet_id) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<rw_spinlock> l(lock_);
   tablets_pending_delete_.erase(tablet_id);
 }
 
+std::size_t TSDescriptor::NumTasks() const {
+  std::shared_lock<rw_spinlock> l(lock_);
+  return tablets_pending_delete_.size();
+}
+
 std::string TSDescriptor::ToString() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::shared_lock<rw_spinlock> l(lock_);
   return Format("{ permanent_uuid: $0 registration: $1 placement_id: $2 }",
                 permanent_uuid_, registration_, placement_id_);
 }

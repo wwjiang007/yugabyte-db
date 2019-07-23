@@ -32,8 +32,12 @@
 
 #include "yb/tablet/operations/operation.h"
 
+#include "yb/consensus/consensus.h"
+
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
+
+#include "yb/util/size_literals.h"
 
 namespace yb {
 namespace tablet {
@@ -41,10 +45,8 @@ namespace tablet {
 using consensus::DriverType;
 
 Operation::Operation(std::unique_ptr<OperationState> state,
-                     DriverType type,
                      OperationType operation_type)
     : state_(std::move(state)),
-      type_(type),
       operation_type_(operation_type) {
 }
 
@@ -53,20 +55,37 @@ void Operation::Start() {
 }
 
 std::string Operation::LogPrefix() const {
-  return Format("$0: ", this);
+  return Format("T $0 $1: ", state()->tablet()->tablet_id(), this);
+}
+
+void OperationState::CompleteWithStatus(const Status& status) const {
+  if (completion_clbk_) {
+    completion_clbk_->CompleteWithStatus(status);
+  }
+}
+
+void OperationState::SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const {
+  if (completion_clbk_) {
+    completion_clbk_->set_error(status, code);
+  }
 }
 
 OperationState::OperationState(Tablet* tablet)
-    : tablet_(tablet),
-      completion_clbk_(new OperationCompletionCallback()),
-      hybrid_time_error_(0) {
+    : tablet_(tablet) {
 }
 
 Arena* OperationState::arena() {
   if (!arena_) {
-    arena_.emplace(32 * 1024, 4 * 1024 * 1024);
+    arena_.emplace(32_KB, 4_MB);
   }
   return arena_.get_ptr();
+}
+
+void OperationState::set_consensus_round(
+    const scoped_refptr<consensus::ConsensusRound>& consensus_round) {
+  consensus_round_ = consensus_round;
+  op_id_ = consensus_round_->id();
+  UpdateRequestFromConsensusRound();
 }
 
 OperationState::~OperationState() {
@@ -101,6 +120,8 @@ void OperationCompletionCallback::set_error(const Status& status,
 }
 
 void OperationCompletionCallback::set_error(const Status& status) {
+  LOG_IF(DFATAL, !status_.ok()) << "OperationCompletionCallback changing from failure status: "
+                                << status_ << " => " << status;
   status_ = status;
 }
 
@@ -115,8 +136,6 @@ const Status& OperationCompletionCallback::status() const {
 const tserver::TabletServerErrorPB::Code OperationCompletionCallback::error_code() const {
   return code_;
 }
-
-void OperationCompletionCallback::OperationCompleted() {}
 
 OperationCompletionCallback::~OperationCompletionCallback() {}
 

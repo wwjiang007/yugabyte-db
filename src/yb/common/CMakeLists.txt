@@ -94,6 +94,7 @@ ADD_YB_LIBRARY(pgsql_protocol_proto
 
 set(COMMON_SRCS
   id_mapping.cc
+  entity_ids.cc
   key_encoder.cc
   partial_row.cc
   partition.cc
@@ -101,6 +102,7 @@ set(COMMON_SRCS
   schema.cc
   index.cc
   jsonb.cc
+  json_util.cc
   hybrid_time.cc
   doc_hybrid_time.cc
   consistent_read_point.cc
@@ -115,8 +117,9 @@ set(COMMON_SRCS
   ql_rowblock.cc
   ql_resultset.cc
   ql_expr.cc
-  flags.cc
-  pgsql_resultset.cc)
+  common_flags.cc
+  pgsql_resultset.cc
+  roles_permissions.cc)
 
 # Workaround for clang bug https://llvm.org/bugs/show_bug.cgi?id=23757
 # in which it incorrectly optimizes row_key-util.cc and causes incorrect results.

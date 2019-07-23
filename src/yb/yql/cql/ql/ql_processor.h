@@ -52,24 +52,28 @@ class QLMetrics {
   scoped_refptr<yb::Histogram> ql_response_size_bytes_;
 };
 
-class QLProcessor {
+class QLProcessor : public Rescheduler {
  public:
   // Public types.
   typedef std::unique_ptr<QLProcessor> UniPtr;
   typedef std::unique_ptr<const QLProcessor> UniPtrConst;
 
   // Constructors.
-  QLProcessor(std::shared_ptr<client::YBClient> client,
+  QLProcessor(client::YBClient* client,
               std::shared_ptr<client::YBMetaDataCache> cache,
               QLMetrics* ql_metrics,
               const server::ClockPtr& clock,
-              TransactionManagerProvider transaction_manager_provider);
+              TransactionPoolProvider transaction_pool_provider);
   virtual ~QLProcessor();
 
   // Prepare a SQL statement (parse and analyze). A reference to the statement string is saved in
   // the parse tree.
   CHECKED_STATUS Prepare(const std::string& stmt, ParseTree::UniPtr* parse_tree,
-                         bool reparsed = false, const MemTrackerPtr& mem_tracker = nullptr);
+                         bool reparsed = false, const MemTrackerPtr& mem_tracker = nullptr,
+                         const bool internal = false);
+
+  // Check whether the current user has the required permissions to execute the statment.
+  bool CheckPermissions(const ParseTree& parse_tree, StatementExecutedCallback cb);
 
   // Execute a prepared statement (parse tree) or batch. The parse trees and the parameters must not
   // be destroyed until the statements have been executed.
@@ -87,7 +91,8 @@ class QLProcessor {
     ql_env_.set_ql_session(ql_session);
   }
 
-  virtual void RescheduleCurrentCall(std::function<void()> resume_from);
+  bool NeedReschedule() override { return true; }
+  void Reschedule(rpc::ThreadPoolTask* task) override;
 
   //------------------------------------------------------------------------------------------------
   // Environment (YBClient) that processor uses to execute statement.
@@ -107,10 +112,12 @@ class QLProcessor {
 
  private:
   friend class QLTestBase;
+  friend class TestQLProcessor;
 
   // Parse a SQL statement and generate a parse tree.
   CHECKED_STATUS Parse(const std::string& stmt, ParseTree::UniPtr* parse_tree,
-                       bool reparsed = false, const MemTrackerPtr& mem_tracker = nullptr);
+                       bool reparsed = false, const MemTrackerPtr& mem_tracker = nullptr,
+                       const bool internal = false);
 
   // Semantically analyze a parse tree.
   CHECKED_STATUS Analyze(ParseTree::UniPtr* parse_tree);
@@ -118,6 +125,38 @@ class QLProcessor {
   void RunAsyncDone(const std::string& stmt, const StatementParameters& params,
                     const ParseTree* parse_tree, StatementExecutedCallback cb,
                     const Status& s, const ExecutedResult::SharedPtr& result);
+
+  class RunAsyncTask : public rpc::ThreadPoolTask {
+   public:
+    RunAsyncTask& Bind(QLProcessor* processor, const std::string& stmt,
+                       const StatementParameters& params, StatementExecutedCallback cb) {
+      processor_ = processor;
+      stmt_ = &stmt;
+      params_ = &params;
+      cb_ = std::move(cb);
+      return *this;
+    }
+
+    virtual ~RunAsyncTask() {}
+
+   private:
+    void Run() override {
+      auto processor = processor_;
+      processor_ = nullptr;
+      processor->RunAsync(*stmt_, *params_, std::move(cb_), true /* reparsed */);
+    }
+
+    void Done(const Status& status) override {}
+
+    QLProcessor* processor_ = nullptr;
+    const std::string* stmt_;
+    const StatementParameters* params_;
+    StatementExecutedCallback cb_;
+  };
+
+  RunAsyncTask run_async_task_;
+
+  friend class RunAsyncTask;
 };
 
 }  // namespace ql

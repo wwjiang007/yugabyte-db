@@ -24,14 +24,6 @@ using std::shared_ptr;
 using std::string;
 using namespace std::literals;  // NOLINT
 
-using client::YBClient;
-using client::YBSession;
-using client::YBMetaDataCache;
-using client::YBTable;
-using client::YBTableName;
-using client::YBTableType;
-using client::YBPgsqlWriteOp;
-
 // TODO(neil) This should be derived from a GFLAGS.
 static MonoDelta kSessionTimeout = 60s;
 
@@ -40,18 +32,23 @@ static MonoDelta kSessionTimeout = 60s;
 //--------------------------------------------------------------------------------------------------
 
 PgInsert::PgInsert(PgSession::ScopedRefPtr pg_session,
-                   const char *database_name,
-                   const char *schema_name,
-                   const char *table_name)
-    : PgDmlWrite(pg_session, database_name, schema_name, table_name, StmtOp::STMT_INSERT) {
+                   const PgObjectId& table_id,
+                   bool is_single_row_txn)
+    : PgDmlWrite(pg_session, table_id, is_single_row_txn) {
 }
 
 PgInsert::~PgInsert() {
 }
 
 void PgInsert::AllocWriteRequest() {
-  write_op_.reset(table_->NewPgsqlInsert());
-  write_req_ = write_op_->mutable_request();
+  // Allocate WRITE operation.
+  client::YBPgsqlWriteOp *insert_op = table_desc_->NewPgsqlInsert();
+  insert_op->set_is_single_row_txn(is_single_row_txn_);
+  auto doc_op = make_shared<PgDocWriteOp>(pg_session_, insert_op);
+  write_req_ = doc_op->write_op()->mutable_request();
+
+  // Preparation complete.
+  doc_op_ = doc_op;
 }
 
 }  // namespace pggate

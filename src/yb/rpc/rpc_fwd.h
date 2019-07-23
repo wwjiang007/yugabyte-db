@@ -25,6 +25,7 @@
 
 #include "yb/rpc/rpc_introspection.pb.h"
 
+#include "yb/util/enums.h"
 #include "yb/util/strongly_typed_bool.h"
 
 namespace boost {
@@ -47,7 +48,6 @@ class Acceptor;
 class AcceptorPool;
 class ConnectionContext;
 class GrowableBufferAllocator;
-class Messenger;
 class MessengerBuilder;
 class Proxy;
 class ProxyCache;
@@ -62,9 +62,14 @@ class Protocol;
 class Scheduler;
 class ServicePoolImpl;
 class Stream;
+class StreamReadBuffer;
 class ThreadPool;
+class ThreadPoolTask;
 
+struct CallData;
+struct ProcessDataResult;
 struct RpcMethodMetrics;
+struct RpcMetrics;
 
 class RpcCommand;
 typedef std::shared_ptr<RpcCommand> RpcCommandPtr;
@@ -76,6 +81,8 @@ typedef std::weak_ptr<Connection> ConnectionWeakPtr;
 
 class InboundCall;
 typedef std::shared_ptr<InboundCall> InboundCallPtr;
+
+class Messenger;
 
 class OutboundCall;
 typedef std::shared_ptr<OutboundCall> OutboundCallPtr;
@@ -93,6 +100,8 @@ class ErrorStatusPB;
 
 typedef boost::asio::io_service IoService;
 
+typedef std::function<int(const std::string&, const std::string&)> Publisher;
+
 // SteadyTimePoint is something like MonoTime, but 3rd party libraries know it and don't know about
 // our private MonoTime.
 typedef std::chrono::steady_clock::time_point SteadyTimePoint;
@@ -104,6 +113,11 @@ class StreamFactory;
 typedef std::shared_ptr<StreamFactory> StreamFactoryPtr;
 
 YB_STRONGLY_TYPED_BOOL(ReadBufferFull);
+
+typedef int64_t ScheduledTaskId;
+const ScheduledTaskId kInvalidTaskId = -1;
+
+YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
 } // namespace rpc
 } // namespace yb

@@ -125,6 +125,7 @@ PTUpdateStmt::~PTUpdateStmt() {
 }
 
 CHECKED_STATUS PTUpdateStmt::Analyze(SemContext *sem_context) {
+  // If use_cassandra_authentication is set, permissions are checked in PTDmlStmt::Analyze.
   RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));
 
   RETURN_NOT_OK(relation_->Analyze(sem_context));
@@ -247,6 +248,22 @@ CHECKED_STATUS PTUpdateStmt::AnalyzeSetExpr(PTAssign *assign_expr, SemContext *s
 
 void PTUpdateStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
   VLOG(3) << "SEMANTIC ANALYSIS RESULT (" << *loc_ << "):\n" << "Not yet avail";
+}
+
+ExplainPlanPB PTUpdateStmt::AnalysisResultToPB() {
+  ExplainPlanPB explain_plan;
+  UpdatePlanPB *update_plan = explain_plan.mutable_update_plan();
+  update_plan->set_update_type("Update on " + table_name().ToString());
+  update_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name().ToString());
+  string key_conditions = "        Key Conditions: " +
+      conditionsToString<MCVector<ColumnOp>>(key_where_ops());
+  update_plan->set_key_conditions(key_conditions);
+  update_plan->set_output_width(max({
+    update_plan->update_type().length(),
+    update_plan->scan_type().length(),
+    update_plan->key_conditions().length()
+  }));
+  return explain_plan;
 }
 
 }  // namespace ql

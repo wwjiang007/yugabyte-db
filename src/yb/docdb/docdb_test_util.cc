@@ -40,6 +40,7 @@
 #include "yb/util/test_util.h"
 #include "yb/util/tostring.h"
 #include "yb/util/algorithm_util.h"
+#include "yb/util/string_util.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/rocksdb/db/filename.h"
 
@@ -415,7 +416,7 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
     auto encoded_sub_doc_key = sub_doc_key.EncodeWithoutHt();
     GetSubDocumentData data = { encoded_sub_doc_key, &doc_from_rocksdb, &doc_found_in_rocksdb };
     ASSERT_OK(GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                             txn_op_context, MonoTime::Max() /* deadline */));
+                             txn_op_context, CoarseTimePoint::max() /* deadline */));
     if (is_deletion && (
             doc_path.num_subkeys() == 0 ||  // Deleted the entire sub-document,
             !doc_already_exists_in_mem)) {  // or the document did not exist in the first place.
@@ -577,9 +578,22 @@ void DocDBRocksDBFixture::AssertDocDbDebugDumpStrEq(const string &expected) {
   const string debug_dump_str = TrimDocDbDebugDumpStr(DocDBDebugDumpToStr());
   const string expected_str = TrimDocDbDebugDumpStr(expected);
   if (expected_str != debug_dump_str) {
-    LOG(INFO) << "Assertion failure"
-              << "\nExpected DocDB contents:\n\n" << expected_str << "\n"
-              << "\nActual DocDB contents:\n\n" << debug_dump_str << "\n";
+    auto expected_lines = StringSplit(expected_str, '\n');
+    auto actual_lines = StringSplit(debug_dump_str, '\n');
+    vector<int> mismatch_line_numbers;
+    for (int i = 0; i < std::min(expected_lines.size(), actual_lines.size()); ++i) {
+      if (expected_lines[i] != actual_lines[i]) {
+        mismatch_line_numbers.push_back(i + 1);
+      }
+    }
+    LOG(ERROR) << "Assertion failure"
+               << "\nExpected DocDB contents:\n\n" << expected_str << "\n"
+               << "\nActual DocDB contents:\n\n" << debug_dump_str << "\n"
+               << "\nExpected # of lines: " << expected_lines.size()
+               << ", actual # of lines: " << actual_lines.size()
+               << "\nLines not matching: " << yb::ToString(mismatch_line_numbers)
+               << "\nPlease check if source files have trailing whitespace and remove it.";
+
     FAIL();
   }
 }

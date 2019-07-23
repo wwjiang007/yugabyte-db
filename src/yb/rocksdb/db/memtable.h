@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "yb/rocksdb/db/dbformat.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/skiplist.h"
 #include "yb/rocksdb/db/version_edit.h"
 #include "yb/rocksdb/db.h"
@@ -45,6 +46,12 @@
 #include "yb/rocksdb/util/dynamic_bloom.h"
 #include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
+
+namespace yb {
+
+class MemTracker;
+
+}
 
 namespace rocksdb {
 
@@ -74,6 +81,7 @@ struct MemTableOptions {
   Statistics* statistics;
   MergeOperator* merge_operator;
   Logger* info_log;
+  std::shared_ptr<yb::MemTracker> mem_tracker;
 };
 
 YB_DEFINE_ENUM(FlushState, (kNotRequested)(kRequested)(kScheduled));
@@ -334,12 +342,19 @@ class MemTable {
   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
 
   void UpdateFrontiers(const UserFrontiers& value) {
+    std::lock_guard<SpinMutex> l(frontiers_mutex_);
     if (frontiers_) {
-      frontiers_->Merge(value);
+      frontiers_->MergeFrontiers(value);
     } else {
       frontiers_ = value.Clone();
     }
   }
+
+  UserFrontierPtr GetSmallestFrontierLocked() const {
+    std::lock_guard<SpinMutex> l(frontiers_mutex_);
+    return frontiers_->Smallest().Clone();
+  }
+
   const UserFrontiers* Frontiers() const { return frontiers_.get(); }
 
   std::string ToString() const;
@@ -364,9 +379,12 @@ class MemTable {
   std::atomic<uint64_t> num_deletes_;
 
   // These are used to manage memtable flushes to storage
-  bool flush_in_progress_; // started the flush
-  bool flush_completed_;   // finished the flush
-  uint64_t file_number_;    // filled up after flush is complete
+  bool flush_in_progress_;        // started the flush
+  bool flush_completed_;          // finished the flush
+  uint64_t file_number_;          // filled up after flush is complete
+  // Filled up after flush is complete to prevent file from being deleted util it is added into the
+  // VersionSet.
+  FileNumbersHolder file_number_holder_;
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.
@@ -394,6 +412,7 @@ class MemTable {
 
   Env* env_;
 
+  mutable SpinMutex frontiers_mutex_;
   std::unique_ptr<UserFrontiers> frontiers_;
 
   // Returns a heuristic flush decision

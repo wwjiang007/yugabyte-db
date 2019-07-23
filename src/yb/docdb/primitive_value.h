@@ -242,8 +242,9 @@ class PrimitiveValue {
   static PrimitiveValue SystemColumnId(ColumnId column_id);
   static PrimitiveValue SystemColumnId(SystemColumnIds system_column_id);
   static PrimitiveValue Int32(int32_t v, SortOrder sort_order = SortOrder::kAscending);
+  static PrimitiveValue UInt32(uint32_t v, SortOrder sort_order = SortOrder::kAscending);
   static PrimitiveValue TransactionId(Uuid transaction_id);
-  static PrimitiveValue IntentTypeValue(IntentType intent_type);
+  static PrimitiveValue TableId(Uuid table_id);
   static PrimitiveValue Jsonb(const std::string& json);
 
   KeyBytes ToKeyBytes() const;
@@ -262,6 +263,10 @@ class PrimitiveValue {
 
   bool IsTombstoneOrPrimitive() const {
     return IsPrimitiveValueType(type_) || type_ == ValueType::kTombstone;
+  }
+
+  bool IsInfinity() const {
+    return type_ == ValueType::kHighest || type_ == ValueType::kLowest;
   }
 
   int CompareTo(const PrimitiveValue& other) const;
@@ -296,13 +301,21 @@ class PrimitiveValue {
     return int32_val_;
   }
 
+  uint32_t GetUInt32() const {
+    DCHECK(ValueType::kUInt32 == type_ || ValueType::kUInt32Descending == type_);
+    return uint32_val_;
+  }
+
   int64_t GetInt64() const {
     DCHECK(ValueType::kInt64 == type_ || ValueType::kInt64Descending == type_);
     return int64_val_;
   }
 
   uint16_t GetUInt16() const {
-    DCHECK(ValueType::kUInt16Hash == type_ || ValueType::kIntentType == type_);
+    DCHECK(ValueType::kUInt16Hash == type_ ||
+           ValueType::kObsoleteIntentTypeSet == type_ ||
+           ValueType::kObsoleteIntentType == type_ ||
+           ValueType::kIntentTypeSet == type_);
     return uint16_val_;
   }
 
@@ -343,7 +356,7 @@ class PrimitiveValue {
 
   const Uuid& GetUuid() const {
     DCHECK(type_ == ValueType::kUuid || type_ == ValueType::kUuidDescending ||
-        type_ == ValueType::kTransactionId);
+           type_ == ValueType::kTransactionId || type_ == ValueType::kTableId);
     return uuid_val_;
   }
 
@@ -421,6 +434,7 @@ class PrimitiveValue {
   // TODO: do we have to worry about alignment here?
   union {
     int32_t int32_val_;
+    uint32_t uint32_val_;
     int64_t int64_val_;
     uint16_t uint16_val_;
     DocHybridTime hybrid_time_val_;

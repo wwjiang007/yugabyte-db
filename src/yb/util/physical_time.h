@@ -14,6 +14,8 @@
 #ifndef YB_UTIL_PHYSICAL_TIME_H
 #define YB_UTIL_PHYSICAL_TIME_H
 
+#include <boost/atomic.hpp>
+
 #include "yb/util/result.h"
 
 namespace yb {
@@ -55,10 +57,14 @@ class MockClock : public PhysicalClock {
  private:
   // Set by calls to SetMockClockWallTimeForTests().
   // For testing purposes only.
-  std::atomic<PhysicalTime> value_{{0, 0}};
+  boost::atomic<PhysicalTime> value_{{0, 0}};
 };
 
 const PhysicalClockPtr& WallClock();
+
+#if !defined(__APPLE__)
+const PhysicalClockPtr& AdjTimeClock();
+#endif
 
 } // namespace yb
 

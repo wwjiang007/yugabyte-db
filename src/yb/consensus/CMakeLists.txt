@@ -100,6 +100,7 @@ set(LOG_SRCS
   log_index.cc
   log_reader.cc
   log_metrics.cc
+  ${LOG_SRCS_EXTENSIONS}
 )
 
 add_library(log ${LOG_SRCS})
@@ -123,7 +124,9 @@ set(CONSENSUS_SRCS
   peer_manager.cc
   quorum_util.cc
   raft_consensus.cc
-  replica_state.cc)
+  replica_state.cc
+  replicate_msgs_holder.cc
+  retryable_requests.cc)
 
 add_library(consensus ${CONSENSUS_SRCS})
 cotire(consensus)
